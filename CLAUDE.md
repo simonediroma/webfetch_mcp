@@ -104,6 +104,7 @@ fetch(
     max_bytes: int = 0,          # truncate response (0 = unlimited)
     follow_redirects: bool = True,
     output_format: str | None,   # "raw" | "markdown" | "trafilatura" — overrides WEBFETCH_OUTPUT
+    css_selector: str | None,    # CSS selector to extract HTML subset before format conversion
 ) -> str
 ```
 
@@ -159,3 +160,4 @@ For Claude Code's `preview_start` (dev only), port 8000 is declared in
 | `python-dotenv` | Load `.env` at startup |
 | `markdownify` | HTML → Markdown conversion for `"markdown"` output format |
 | `trafilatura` | Main content extraction for `"trafilatura"` output format |
+| `beautifulsoup4` | CSS selector extraction (`css_selector` parameter) |
