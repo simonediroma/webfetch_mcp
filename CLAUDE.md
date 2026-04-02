@@ -37,6 +37,8 @@ cp .env.example .env   # then edit .env with real tokens
 
 ## Configuration (`.env`)
 
+### `WEBFETCH_HEADERS` — domain-scoped request headers
+
 `WEBFETCH_HEADERS` is a **single-line JSON object** with domain-scoped headers:
 
 ```env
@@ -49,6 +51,22 @@ WEBFETCH_HEADERS={"*": {"User-Agent": "MyBot/1.0"}, "example.com": {"X-Akamai-To
 | `"example.com"` | Applied only when hostname ends with `example.com` |
 
 Merge order (later wins): `*` → domain-specific → per-call `extra_headers`.
+
+### `WEBFETCH_OUTPUT` — domain-scoped output format
+
+`WEBFETCH_OUTPUT` is a **single-line JSON object** controlling how the response body is returned:
+
+```env
+WEBFETCH_OUTPUT={"*": "raw", "example.com": "trafilatura", "news.com": "markdown"}
+```
+
+| Value | Behaviour |
+|-------|-----------|
+| `"raw"` | Return raw HTML as-is (default) |
+| `"markdown"` | Convert full HTML to Markdown via `markdownify` |
+| `"trafilatura"` | Extract main content and return as Markdown via `trafilatura` (falls back to raw if extraction fails) |
+
+Merge order (later wins): `*` → domain-specific → per-call `output_format` parameter.
 
 ---
 
@@ -82,8 +100,10 @@ fetch(
     method: str = "GET",         # HTTP verb
     body: str | None = None,     # request body for POST/PUT
     extra_headers: dict | None,  # per-call headers (merged on top)
-    extract_text: bool = False,  # strip HTML → clean text
+    extract_text: bool = False,  # legacy: strip HTML → clean text (wins over output_format)
     max_bytes: int = 0,          # truncate response (0 = unlimited)
+    follow_redirects: bool = True,
+    output_format: str | None,   # "raw" | "markdown" | "trafilatura" — overrides WEBFETCH_OUTPUT
 ) -> str
 ```
 
@@ -122,7 +142,10 @@ For Claude Code's `preview_start` (dev only), port 8000 is declared in
 - `_resolve_headers(hostname, extra_headers)` — merges global + domain + per-call headers.
   Domain matching: `hostname == key or hostname.endswith("." + key)`.
   Multiple matches are applied longest-key-last (most specific wins).
-- `_extract_text(html)` — regex tag stripping + whitespace collapse.
+- `_load_output_config()` — parses `WEBFETCH_OUTPUT` at startup; validates each value against `_VALID_OUTPUT_FORMATS`.
+- `_resolve_output_format(hostname, per_call_format)` — same domain-matching logic as headers; returns effective format string.
+- `_apply_output_format(content, fmt)` — dispatches to `markdownify` or `trafilatura` based on format; uses lazy imports.
+- `_extract_text(html)` — regex tag stripping + whitespace collapse (internal, used by legacy `extract_text=True`).
 - Uses `httpx.AsyncClient` with `follow_redirects=True`.
 
 ---
@@ -134,3 +157,5 @@ For Claude Code's `preview_start` (dev only), port 8000 is declared in
 | `mcp[cli]` | MCP server framework (FastMCP) |
 | `httpx` | Async HTTP client |
 | `python-dotenv` | Load `.env` at startup |
+| `markdownify` | HTML → Markdown conversion for `"markdown"` output format |
+| `trafilatura` | Main content extraction for `"trafilatura"` output format |

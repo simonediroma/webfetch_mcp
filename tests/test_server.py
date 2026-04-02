@@ -15,15 +15,19 @@ import pytest
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _reload_server(monkeypatch, env_value):
+def _reload_server(monkeypatch, env_value, output_value=None):
     """
-    Re-import server with a controlled WEBFETCH_HEADERS env value.
-    Necessary because _HEADER_CONFIG is set at module load time.
+    Re-import server with controlled WEBFETCH_HEADERS and WEBFETCH_OUTPUT env values.
+    Necessary because _HEADER_CONFIG and _OUTPUT_CONFIG are set at module load time.
     """
     if env_value is None:
         monkeypatch.delenv("WEBFETCH_HEADERS", raising=False)
     else:
         monkeypatch.setenv("WEBFETCH_HEADERS", env_value)
+    if output_value is None:
+        monkeypatch.delenv("WEBFETCH_OUTPUT", raising=False)
+    else:
+        monkeypatch.setenv("WEBFETCH_OUTPUT", output_value)
     # Remove cached module so it fully re-executes on import
     sys.modules.pop("server", None)
     import server
