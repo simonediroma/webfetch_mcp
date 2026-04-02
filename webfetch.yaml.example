@@ -1,0 +1,78 @@
+# WebFetch MCP — YAML configuration file
+#
+# Usage: set the environment variable WEBFETCH_CONFIG to the absolute path
+# of this file (after copying it to webfetch.yaml and editing it):
+#
+#   WEBFETCH_CONFIG=/absolute/path/to/webfetch.yaml
+#
+# When WEBFETCH_CONFIG is set, this file is used instead of the legacy
+# WEBFETCH_HEADERS / WEBFETCH_OUTPUT environment variables.
+#
+# All fields under "global" and each domain entry are optional.
+# Domain keys support suffix matching: "example.com" matches both
+# "example.com" and "www.example.com".
+# The most specific (longest) matching domain wins on conflicts.
+
+# ---------------------------------------------------------------------------
+# Global defaults — applied to every request unless overridden by a domain
+# ---------------------------------------------------------------------------
+global:
+  # HTTP headers injected into every outbound request
+  headers:
+    User-Agent: "MyBot/1.0"
+
+  # Default response output format.
+  # Values: "raw" | "markdown" | "trafilatura" | "json"
+  #   raw         — return body as-is (default)
+  #   markdown    — convert HTML to Markdown (markdownify)
+  #   trafilatura — extract main content as Markdown (trafilatura)
+  #   json        — pretty-print JSON body (auto-detected when Content-Type is
+  #                 application/json even if not set explicitly)
+  output_format: raw
+
+  # Request timeout in seconds (default: 30)
+  timeout: 30
+
+  # Retry on HTTP 5xx responses or transient network errors.
+  # attempts: total number of tries (1 = no retry, default)
+  # backoff:  delay multiplier between retries (delay starts at 1s)
+  #           e.g. backoff=2.0 → waits 1s, 2s, 4s, …
+  retry:
+    attempts: 1
+    backoff: 2.0
+
+  # Outbound HTTP proxy URL (null = no proxy, default)
+  proxy: null
+
+# ---------------------------------------------------------------------------
+# Per-domain overrides
+# All fields are optional — only the fields present override the global value.
+# ---------------------------------------------------------------------------
+domains:
+  # example.com and any subdomain (e.g. www.example.com)
+  example.com:
+    headers:
+      X-Akamai-Token: "token-for-example"
+    output_format: trafilatura
+    timeout: 60
+    retry:
+      attempts: 3
+      backoff: 2.0
+
+  # News sites — convert to clean Markdown
+  news.com:
+    output_format: markdown
+
+  # A domain behind a corporate proxy
+  internal.corp:
+    proxy: "http://proxy.corp:8080"
+    headers:
+      Authorization: "Bearer my-internal-token"
+
+  # A JSON API endpoint — pretty-print output
+  api.example.com:
+    output_format: json
+    timeout: 10
+    retry:
+      attempts: 5
+      backoff: 1.5
