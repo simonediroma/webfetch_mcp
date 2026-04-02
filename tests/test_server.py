@@ -31,10 +31,15 @@ def _reload_server(monkeypatch, env_value):
 
 
 def _make_mock_response(status_code=200, text="<html>hello</html>"):
+    from http import HTTPStatus
     response = MagicMock()
     response.status_code = status_code
     response.text = text
     response.is_error = status_code >= 400
+    try:
+        response.reason_phrase = HTTPStatus(status_code).phrase
+    except ValueError:
+        response.reason_phrase = "Unknown"
     return response
 
 
@@ -214,7 +219,8 @@ class TestFetch:
         async_cm, _ = _make_async_client_mock(response)
         with patch("httpx.AsyncClient", return_value=async_cm):
             result = await self.server.fetch("http://example.com/")
-        assert "Status: 200" in result
+        assert "--- Request Summary ---" in result
+        assert "Status:         200 OK" in result
         assert "hello world" in result
 
     async def test_injected_headers_appear_in_output_and_are_sent(self, monkeypatch):
@@ -271,3 +277,38 @@ class TestFetch:
         with patch("httpx.AsyncClient", return_value=async_cm):
             result = await self.server.fetch("http://example.com/")
         assert "Injected headers: none" in result
+
+    async def test_summary_block_fields(self):
+        response = _make_mock_response(200, "body text")
+        async_cm, _ = _make_async_client_mock(response)
+        with patch("httpx.AsyncClient", return_value=async_cm):
+            result = await self.server.fetch("http://example.com/page", method="POST")
+        assert "--- Request Summary ---" in result
+        assert "URL:            http://example.com/page" in result
+        assert "Method:         POST" in result
+        assert "Status:         200 OK" in result
+        assert f"Response size:  {len('body text')} bytes" in result
+        assert "Text extracted: no" in result
+        assert "Truncated:      no" in result
+
+    async def test_summary_shows_text_extracted_yes(self):
+        response = _make_mock_response(200, "<p>hi</p>")
+        async_cm, _ = _make_async_client_mock(response)
+        with patch("httpx.AsyncClient", return_value=async_cm):
+            result = await self.server.fetch("http://example.com/", extract_text=True)
+        assert "Text extracted: yes" in result
+
+    async def test_summary_shows_truncated_yes(self):
+        response = _make_mock_response(200, "A" * 1000)
+        async_cm, _ = _make_async_client_mock(response)
+        with patch("httpx.AsyncClient", return_value=async_cm):
+            result = await self.server.fetch("http://example.com/", max_bytes=50)
+        assert "Truncated:      yes (max_bytes=50)" in result
+        assert "Response size:  1000 bytes" in result
+
+    async def test_response_size_is_pre_truncation(self):
+        response = _make_mock_response(200, "B" * 500)
+        async_cm, _ = _make_async_client_mock(response)
+        with patch("httpx.AsyncClient", return_value=async_cm):
+            result = await self.server.fetch("http://example.com/", max_bytes=10)
+        assert "Response size:  500 bytes" in result

@@ -158,6 +158,7 @@ async def fetch(
         _log.warning("fetch %s %s returned HTTP %s", method.upper(), url, response.status_code)
 
     content = response.text
+    response_size = len(content)  # capture before any transformation
 
     if extract_text:
         content = _extract_text(content)
@@ -166,7 +167,19 @@ async def fetch(
         content = content[:max_bytes]
 
     injected = ", ".join(applied_header_names) if applied_header_names else "none"
-    return f"Status: {response.status_code}\nInjected headers: {injected}\n\n{content}"
+    truncated_str = f"yes (max_bytes={max_bytes})" if max_bytes > 0 else "no"
+    summary = (
+        f"--- Request Summary ---\n"
+        f"URL:            {url}\n"
+        f"Method:         {method.upper()}\n"
+        f"Injected headers: {injected}\n"
+        f"Status:         {response.status_code} {response.reason_phrase}\n"
+        f"Response size:  {response_size} bytes\n"
+        f"Text extracted: {'yes' if extract_text else 'no'}\n"
+        f"Truncated:      {truncated_str}\n"
+        f"---"
+    )
+    return f"{summary}\n\n{content}"
 
 
 if __name__ == "__main__":
