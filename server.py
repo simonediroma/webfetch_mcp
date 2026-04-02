@@ -54,6 +54,49 @@ _log.info(
     len([k for k in _HEADER_CONFIG if k != "*"]),
 )
 
+_VALID_OUTPUT_FORMATS = frozenset({"raw", "markdown", "trafilatura"})
+
+
+def _load_output_config() -> dict[str, str]:
+    """
+    Load WEBFETCH_OUTPUT from the environment.
+
+    Expected format: a JSON object whose keys are domain suffixes or "*" (global),
+    and whose values are output format strings: "raw", "markdown", or "trafilatura".
+    Example:
+        {
+          "*":           "raw",
+          "example.com": "trafilatura",
+          "news.com":    "markdown"
+        }
+
+    Returns an empty dict if the variable is missing.
+    """
+    raw = os.getenv("WEBFETCH_OUTPUT", "")
+    if not raw:
+        return {}
+    try:
+        config = json.loads(raw)
+        if not isinstance(config, dict):
+            raise ValueError("WEBFETCH_OUTPUT must be a JSON object")
+        for domain_key, fmt in config.items():
+            if fmt not in _VALID_OUTPUT_FORMATS:
+                raise ValueError(
+                    f"Invalid output format {fmt!r} for key {domain_key!r}. "
+                    f"Must be one of: {sorted(_VALID_OUTPUT_FORMATS)}"
+                )
+        return config
+    except (json.JSONDecodeError, ValueError) as exc:
+        _log.error("Failed to parse WEBFETCH_OUTPUT: %s", exc)
+        raise RuntimeError(f"Invalid WEBFETCH_OUTPUT value: {exc}") from exc
+
+
+_OUTPUT_CONFIG: dict[str, str] = _load_output_config()
+_log.info(
+    "webfetch startup: %d output format domain(s) configured",
+    len([k for k in _OUTPUT_CONFIG if k != "*"]),
+)
+
 
 def _resolve_headers(hostname: str, extra_headers: dict[str, str] | None) -> dict[str, str]:
     """
@@ -87,6 +130,63 @@ def _resolve_headers(hostname: str, extra_headers: dict[str, str] | None) -> dic
     return headers
 
 
+def _resolve_output_format(hostname: str, per_call_format: str | None) -> str:
+    """
+    Determine the effective output format for a given hostname.
+
+    Precedence (later wins):
+      1. "raw" (hardcoded default)
+      2. Global config ("*") from WEBFETCH_OUTPUT
+      3. Most-specific matching domain config (longer key = more specific)
+      4. per_call_format argument (None means "don't override")
+
+    Note: extract_text=True is handled separately in fetch() and always wins.
+    """
+    fmt = _OUTPUT_CONFIG.get("*", "raw")
+
+    matching = [
+        key for key in _OUTPUT_CONFIG
+        if key != "*" and (hostname == key or hostname.endswith("." + key))
+    ]
+    matching.sort(key=len)
+    for domain_key in matching:
+        fmt = _OUTPUT_CONFIG[domain_key]
+
+    if per_call_format is not None:
+        fmt = per_call_format
+
+    return fmt
+
+
+def _apply_output_format(content: str, fmt: str) -> str:
+    """
+    Convert *content* (raw HTML string) to the requested output format.
+
+    Formats:
+      "raw"         — return as-is
+      "text"        — regex tag-strip (internal alias for extract_text=True)
+      "markdown"    — convert full HTML to Markdown via markdownify
+      "trafilatura" — extract main content as Markdown via trafilatura;
+                      falls back to raw HTML if trafilatura returns None
+    """
+    if fmt == "raw":
+        return content
+    if fmt == "text":
+        return _extract_text(content)
+    if fmt == "markdown":
+        import markdownify  # lazy import: only needed when format is used
+        return markdownify.markdownify(content, strip=["script", "style"])
+    if fmt == "trafilatura":
+        import trafilatura  # lazy import: only needed when format is used
+        extracted = trafilatura.extract(content, output_format="markdown")
+        if extracted is None:
+            _log.warning("trafilatura returned None; falling back to raw HTML")
+            return content
+        return extracted
+    _log.error("Unknown output format %r; returning raw content", fmt)
+    return content
+
+
 def _extract_text(html: str) -> str:
     """Strip HTML tags and collapse whitespace."""
     text = re.sub(r"<[^>]+>", " ", html)
@@ -115,6 +215,7 @@ async def fetch(
     extract_text: bool = False,
     max_bytes: int = 0,
     follow_redirects: bool = True,
+    output_format: str | None = None,
 ) -> str:
     """
     Fetch a URL and return its response, injecting domain-scoped authentication
@@ -127,12 +228,23 @@ async def fetch(
         extra_headers:    Additional headers to send for this request only.
                           These are merged on top of the base domain headers.
         extract_text:     If True, strip HTML tags and return clean readable text.
+                          Legacy parameter — takes priority over output_format.
         max_bytes:        Truncate the response body to this many characters.
                           0 means no limit.
         follow_redirects: Follow HTTP redirects automatically. Default: True.
+        output_format:    Override the output format for this request only.
+                          Accepted values: "raw" (default), "markdown", "trafilatura".
+                          Takes precedence over WEBFETCH_OUTPUT domain config.
+                          Ignored if extract_text=True is also passed (legacy compat).
     """
     parsed = urlparse(url)
     hostname = parsed.hostname or ""
+
+    if output_format is not None and output_format not in _VALID_OUTPUT_FORMATS:
+        raise ValueError(
+            f"Invalid output_format {output_format!r}. "
+            f"Must be one of: {sorted(_VALID_OUTPUT_FORMATS)}"
+        )
 
     headers = _resolve_headers(hostname, extra_headers)
     _validate_headers(headers)
@@ -159,8 +271,13 @@ async def fetch(
 
     content = response.text
 
+    # extract_text=True is the legacy override; it wins over output_format and domain config.
     if extract_text:
-        content = _extract_text(content)
+        effective_fmt = "text"
+    else:
+        effective_fmt = _resolve_output_format(hostname, output_format)
+
+    content = _apply_output_format(content, effective_fmt)
 
     if max_bytes > 0:
         content = content[:max_bytes]
