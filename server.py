@@ -31,12 +31,44 @@ _log = logging.getLogger(__name__)
 
 _VALID_OUTPUT_FORMATS = frozenset({"raw", "markdown", "trafilatura", "json"})
 
+_VALID_SANITIZE_MODES = frozenset({"flag", "strip"})
+_VALID_BOT_BLOCK_MODES = frozenset({"report", "retry"})
+
+_INJECTION_PATTERNS = [
+    re.compile(r"ignore\s+all\s+previous\s+instructions?", re.I),
+    re.compile(r"you\s+are\s+now\s+(?:a|an)\s+\w+", re.I),
+    re.compile(r"act\s+as\s+(?:a|an)\s+\w+", re.I),
+    re.compile(r"disregard\s+(?:all\s+)?(?:previous|prior)\s+instructions?", re.I),
+    re.compile(r"new\s+instructions?:\s*\n", re.I),
+    re.compile(r"system\s+prompt\s*:", re.I),
+    re.compile(r"<\|(?:system|user|assistant)\|>", re.I),
+]
+
+_BOT_BLOCK_STATUS_CODES = frozenset({403, 429, 503})
+_BOT_BLOCK_HEADER_SIGNALS = {"cf-ray", "cf-mitigated"}
+_BOT_BLOCK_BODY_PATTERNS = [
+    re.compile(r"cloudflare", re.I),
+    re.compile(r"captcha", re.I),
+    re.compile(r"access\s+denied", re.I),
+    re.compile(r"please\s+verify", re.I),
+    re.compile(r"bot\s+detection", re.I),
+    re.compile(r"are\s+you\s+human", re.I),
+]
+_CHROME_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/123.0.0.0 Safari/537.36"
+)
+
 _DEFAULT_GLOBAL: dict = {
     "headers": {},
     "output_format": "raw",
     "timeout": 30.0,
     "retry": {"attempts": 1, "backoff": 2.0},
     "proxy": None,
+    "extract_metadata": False,
+    "sanitize_content": False,
+    "bot_block_detection": False,
 }
 
 # ---------------------------------------------------------------------------
@@ -155,6 +187,32 @@ def _merge_domain_section(target: dict, source: dict, *, context: str) -> None:
                     f"'{context}.retry.backoff' must be a number"
                 )
         target["retry"] = retry
+
+    if "extract_metadata" in source:
+        val = source["extract_metadata"]
+        if not isinstance(val, bool):
+            raise RuntimeError(
+                f"'{context}.extract_metadata' must be a boolean, got {type(val).__name__!r}"
+            )
+        target["extract_metadata"] = val
+
+    if "sanitize_content" in source:
+        val = source["sanitize_content"]
+        if val is not False and val not in _VALID_SANITIZE_MODES:
+            raise RuntimeError(
+                f"'{context}.sanitize_content' is {val!r}; "
+                f"must be false or one of {sorted(_VALID_SANITIZE_MODES)}"
+            )
+        target["sanitize_content"] = val
+
+    if "bot_block_detection" in source:
+        val = source["bot_block_detection"]
+        if val is not False and val not in _VALID_BOT_BLOCK_MODES:
+            raise RuntimeError(
+                f"'{context}.bot_block_detection' is {val!r}; "
+                f"must be false or one of {sorted(_VALID_BOT_BLOCK_MODES)}"
+            )
+        target["bot_block_detection"] = val
 
 
 def _load_env_config() -> dict:
@@ -316,6 +374,36 @@ def _resolve_retry(hostname: str) -> dict:
     return {"attempts": int(attempts), "backoff": float(backoff)}
 
 
+def _resolve_extract_metadata(hostname: str) -> bool:
+    """Return effective extract_metadata flag for *hostname*."""
+    val = _CONFIG["global"].get("extract_metadata", False)
+    for key in _matching_domain_keys(hostname, _CONFIG["domains"]):
+        domain = _CONFIG["domains"][key]
+        if "extract_metadata" in domain:
+            val = domain["extract_metadata"]
+    return bool(val)
+
+
+def _resolve_sanitize_content(hostname: str) -> str | bool:
+    """Return effective sanitize_content mode for *hostname* (False, 'flag', or 'strip')."""
+    val: str | bool = _CONFIG["global"].get("sanitize_content", False)
+    for key in _matching_domain_keys(hostname, _CONFIG["domains"]):
+        domain = _CONFIG["domains"][key]
+        if "sanitize_content" in domain:
+            val = domain["sanitize_content"]
+    return val
+
+
+def _resolve_bot_block_detection(hostname: str) -> str | bool:
+    """Return effective bot_block_detection mode for *hostname* (False, 'report', or 'retry')."""
+    val: str | bool = _CONFIG["global"].get("bot_block_detection", False)
+    for key in _matching_domain_keys(hostname, _CONFIG["domains"]):
+        domain = _CONFIG["domains"][key]
+        if "bot_block_detection" in domain:
+            val = domain["bot_block_detection"]
+    return val
+
+
 # ---------------------------------------------------------------------------
 # Output formatting
 # ---------------------------------------------------------------------------
@@ -362,6 +450,66 @@ def _extract_text(html: str) -> str:
     text = re.sub(r"<[^>]+>", " ", html)
     text = re.sub(r"\s+", " ", text)
     return text.strip()
+
+
+def _extract_trafilatura_metadata(raw_html: str) -> str | None:
+    """Extract title/author/date/sitename from HTML via trafilatura.
+
+    Returns a formatted markdown block, or None if no metadata was found.
+    """
+    try:
+        import trafilatura  # lazy import
+        meta = trafilatura.extract_metadata(raw_html)
+        if meta is None:
+            return None
+        parts = []
+        if meta.title:
+            parts.append(f"**Title:** {meta.title}")
+        if meta.author:
+            parts.append(f"**Author:** {meta.author}")
+        if meta.date:
+            parts.append(f"**Date:** {meta.date}")
+        if meta.sitename:
+            parts.append(f"**Source:** {meta.sitename}")
+        return "\n".join(parts) if parts else None
+    except Exception as exc:
+        _log.warning("trafilatura metadata extraction failed: %s", exc)
+        return None
+
+
+def _sanitize_content(content: str, mode: str) -> tuple[str, list[str]]:
+    """Scan *content* for prompt-injection patterns.
+
+    Returns ``(content, matched_patterns)`` where *content* is optionally
+    modified (in ``"strip"`` mode) and *matched_patterns* lists the regex
+    patterns that fired.
+    """
+    matched: list[str] = []
+    for pat in _INJECTION_PATTERNS:
+        if pat.search(content):
+            matched.append(pat.pattern)
+            if mode == "strip":
+                content = pat.sub("[REMOVED]", content)
+    return content, matched
+
+
+def _detect_bot_block(status_code: int, resp_headers: dict, body: str) -> str | None:
+    """Return a reason string if a bot-block or paywall is detected, else None.
+
+    Checks status code, response headers, and the first 8 KB of the body.
+    """
+    reasons: list[str] = []
+    if status_code in _BOT_BLOCK_STATUS_CODES:
+        reasons.append(f"HTTP {status_code}")
+    for sig in _BOT_BLOCK_HEADER_SIGNALS:
+        if sig in resp_headers:
+            reasons.append(f"header:{sig}")
+    snippet = body[:8192]
+    for pat in _BOT_BLOCK_BODY_PATTERNS:
+        if pat.search(snippet):
+            reasons.append(f"body:{pat.pattern!r}")
+            break  # one body signal is sufficient
+    return ", ".join(reasons) if reasons else None
 
 
 # ---------------------------------------------------------------------------
@@ -499,7 +647,48 @@ async def fetch(
         _log.warning("fetch %s %s returned HTTP %s", method.upper(), url, response.status_code)
 
     content = response.text
+    raw_html = content  # preserve original for metadata extraction and bot-block scanning
     response_size = len(content)
+
+    # --- Bot-block / paywall detection (Feature 3) ---
+    bot_block_mode = _resolve_bot_block_detection(hostname)
+    bot_block_reason: str | None = None
+    chrome_retry_attempted = False
+
+    if bot_block_mode and bot_block_mode in _VALID_BOT_BLOCK_MODES:
+        bot_block_reason = _detect_bot_block(
+            response.status_code,
+            dict(response.headers),
+            raw_html,
+        )
+        if bot_block_reason and bot_block_mode == "retry":
+            chrome_retry_attempted = True
+            retry_headers = {**headers, "User-Agent": _CHROME_UA}
+            _log.info("bot-block detected (%s); retrying with Chrome UA", bot_block_reason)
+            async with httpx.AsyncClient(**client_kwargs) as chrome_client:
+                try:
+                    chrome_resp = await chrome_client.request(
+                        method=method.upper(),
+                        url=url,
+                        headers=retry_headers,
+                        content=body.encode() if body else None,
+                    )
+                    chrome_block = _detect_bot_block(
+                        chrome_resp.status_code,
+                        dict(chrome_resp.headers),
+                        chrome_resp.text[:8192],
+                    )
+                    if not chrome_block:
+                        # Chrome retry succeeded — use its response
+                        response = chrome_resp
+                        content = chrome_resp.text
+                        raw_html = content
+                        response_size = len(content)
+                        bot_block_reason = None
+                    else:
+                        _log.warning("Chrome UA retry also blocked: %s", chrome_block)
+                except (httpx.TransportError, httpx.TimeoutException) as exc:
+                    _log.warning("Chrome UA retry failed: %s", exc)
 
     # Detect JSON from Content-Type when no explicit format is set
     content_type = response.headers.get("content-type", "")
@@ -513,13 +702,48 @@ async def fetch(
 
     content = _apply_output_format(content, effective_fmt)
 
+    # --- Metadata extraction (Feature 1) ---
+    extract_meta = _resolve_extract_metadata(hostname)
+    metadata_block: str | None = None
+    if extract_meta and effective_fmt == "trafilatura":
+        metadata_block = _extract_trafilatura_metadata(raw_html)
+        if metadata_block:
+            content = metadata_block + "\n\n---\n\n" + content
+
     if max_bytes > 0:
         content = content[:max_bytes]
+
+    # --- Prompt-injection sanitization (Feature 2) ---
+    sanitize_mode = _resolve_sanitize_content(hostname)
+    injection_warnings: list[str] = []
+    if sanitize_mode and sanitize_mode in _VALID_SANITIZE_MODES:
+        content, injection_warnings = _sanitize_content(content, sanitize_mode)
+        if injection_warnings and sanitize_mode == "flag":
+            warning = (
+                "\n\n⚠️ **PROMPT INJECTION WARNING:** "
+                "Suspicious patterns detected in fetched content."
+            )
+            content = warning + "\n\n" + content
 
     injected = ", ".join(applied_header_names) if applied_header_names else "none"
     truncated_str = f"yes (max_bytes={max_bytes})" if max_bytes > 0 else "no"
     proxy_str = proxy or "none"
     retry_str = f"{actual_attempts}/{attempts}" if attempts > 1 else "disabled"
+
+    # Build optional extra summary lines for new features
+    extra_lines = ""
+    if bot_block_mode:
+        reason_str = bot_block_reason if bot_block_reason else "none"
+        extra_lines += f"\nBot block:        {reason_str}"
+        if bot_block_mode == "retry":
+            extra_lines += f"\nChrome retry:     {'yes' if chrome_retry_attempted else 'no'}"
+    if extract_meta:
+        extra_lines += f"\nMetadata:         {'extracted' if metadata_block else 'no'}"
+    if sanitize_mode:
+        extra_lines += (
+            f"\nSanitization:     {sanitize_mode} "
+            f"({len(injection_warnings)} pattern(s) found)"
+        )
 
     summary = (
         f"--- Request Summary ---\n"
@@ -533,7 +757,8 @@ async def fetch(
         f"Truncated:        {truncated_str}\n"
         f"Timeout:          {timeout}s\n"
         f"Proxy:            {proxy_str}\n"
-        f"Retry:            {retry_str}\n"
+        f"Retry:            {retry_str}"
+        f"{extra_lines}\n"
         f"---"
     )
     return f"{summary}\n\n{content}"
