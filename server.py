@@ -5,6 +5,7 @@ custom HTTP headers (e.g. Akamai bot-defender authentication).
 """
 
 import json
+import logging
 import os
 import re
 from urllib.parse import urlparse
@@ -16,6 +17,7 @@ from mcp.server.fastmcp import FastMCP
 load_dotenv()
 
 mcp = FastMCP("webfetch")
+_log = logging.getLogger(__name__)
 
 
 def _load_header_config() -> dict[str, dict[str, str]]:
@@ -41,11 +43,16 @@ def _load_header_config() -> dict[str, dict[str, str]]:
             raise ValueError("WEBFETCH_HEADERS must be a JSON object")
         return config
     except (json.JSONDecodeError, ValueError) as exc:
+        _log.error("Failed to parse WEBFETCH_HEADERS: %s", exc)
         raise RuntimeError(f"Invalid WEBFETCH_HEADERS value: {exc}") from exc
 
 
 # Load once at startup
 _HEADER_CONFIG: dict[str, dict[str, str]] = _load_header_config()
+_log.info(
+    "webfetch startup: %d domain(s) configured",
+    len([k for k in _HEADER_CONFIG if k != "*"]),
+)
 
 
 def _resolve_headers(hostname: str, extra_headers: dict[str, str] | None) -> dict[str, str]:
@@ -87,6 +94,18 @@ def _extract_text(html: str) -> str:
     return text.strip()
 
 
+_INVALID_HEADER_RE = re.compile(r"[\r\n\x00]")
+
+
+def _validate_headers(headers: dict[str, str]) -> None:
+    """Raise ValueError if any header name or value contains \\r, \\n, or NUL."""
+    for name, value in headers.items():
+        if _INVALID_HEADER_RE.search(name):
+            raise ValueError(f"Invalid header name contains control character: {name!r}")
+        if _INVALID_HEADER_RE.search(str(value)):
+            raise ValueError(f"Invalid value for header {name!r} contains control character")
+
+
 @mcp.tool()
 async def fetch(
     url: str,
@@ -95,34 +114,48 @@ async def fetch(
     extra_headers: dict | None = None,
     extract_text: bool = False,
     max_bytes: int = 0,
+    follow_redirects: bool = True,
 ) -> str:
     """
     Fetch a URL and return its response, injecting domain-scoped authentication
     headers (e.g. Akamai bot-defender tokens) automatically.
 
     Args:
-        url:           The URL to request.
-        method:        HTTP method (GET, POST, PUT, DELETE, …). Default: GET.
-        body:          Optional request body string (for POST/PUT).
-        extra_headers: Additional headers to send for this request only.
-                       These are merged on top of the base domain headers.
-        extract_text:  If True, strip HTML tags and return clean readable text.
-        max_bytes:     Truncate the response body to this many characters.
-                       0 means no limit.
+        url:              The URL to request.
+        method:           HTTP method (GET, POST, PUT, DELETE, …). Default: GET.
+        body:             Optional request body string (for POST/PUT).
+        extra_headers:    Additional headers to send for this request only.
+                          These are merged on top of the base domain headers.
+        extract_text:     If True, strip HTML tags and return clean readable text.
+        max_bytes:        Truncate the response body to this many characters.
+                          0 means no limit.
+        follow_redirects: Follow HTTP redirects automatically. Default: True.
     """
     parsed = urlparse(url)
     hostname = parsed.hostname or ""
 
     headers = _resolve_headers(hostname, extra_headers)
+    _validate_headers(headers)
     applied_header_names = list(headers.keys())
 
-    async with httpx.AsyncClient(follow_redirects=True) as client:
+    _log.info(
+        "fetch %s %s (hostname=%s, injected=%s)",
+        method.upper(),
+        url,
+        hostname,
+        applied_header_names or "none",
+    )
+
+    async with httpx.AsyncClient(follow_redirects=follow_redirects) as client:
         response = await client.request(
             method=method.upper(),
             url=url,
             headers=headers,
             content=body.encode() if body else None,
         )
+
+    if response.is_error:
+        _log.warning("fetch %s %s returned HTTP %s", method.upper(), url, response.status_code)
 
     content = response.text
 
@@ -137,4 +170,8 @@ async def fetch(
 
 
 if __name__ == "__main__":
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    )
     mcp.run()
