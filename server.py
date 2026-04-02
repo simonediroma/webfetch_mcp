@@ -452,6 +452,25 @@ def _extract_text(html: str) -> str:
     return text.strip()
 
 
+def _apply_css_selector(html: str, selector: str) -> str:
+    """Estrae gli elementi HTML corrispondenti a *selector*.
+
+    Restituisce l'HTML esterno di tutti gli elementi trovati, uniti da newline.
+    In caso di nessun match o errore di parsing, restituisce l'HTML originale.
+    """
+    try:
+        from bs4 import BeautifulSoup  # lazy import
+        soup = BeautifulSoup(html, "html.parser")
+        matches = soup.select(selector)
+        if not matches:
+            _log.warning("css_selector %r matched no elements; returning full HTML", selector)
+            return html
+        return "\n".join(str(el) for el in matches)
+    except Exception as exc:
+        _log.warning("css_selector %r failed (%s); returning full HTML", selector, exc)
+        return html
+
+
 def _extract_trafilatura_metadata(raw_html: str) -> str | None:
     """Extract title/author/date/sitename from HTML via trafilatura.
 
@@ -542,6 +561,7 @@ async def fetch(
     max_bytes: int = 0,
     follow_redirects: bool = True,
     output_format: str | None = None,
+    css_selector: str | None = None,
 ) -> str:
     """
     Fetch a URL and return its response, injecting domain-scoped authentication
@@ -562,6 +582,10 @@ async def fetch(
                           Accepted values: "raw" (default), "markdown",
                           "trafilatura", "json".
                           Ignored if extract_text=True (legacy compat).
+        css_selector:     Selettore CSS per estrarre un sottoinsieme dell'HTML
+                          prima della conversione di formato (es. "article",
+                          "#main-content", ".post-body p").
+                          Opzionale. Se None o nessun match: HTML completo.
     """
     parsed = urlparse(url)
     hostname = parsed.hostname or ""
@@ -700,6 +724,12 @@ async def fetch(
         if effective_fmt == "raw" and "application/json" in content_type:
             effective_fmt = "json"
 
+    # --- CSS selector extraction ---
+    css_selector_applied = False
+    if css_selector and "html" in content_type.lower():
+        content = _apply_css_selector(content, css_selector)
+        css_selector_applied = True
+
     content = _apply_output_format(content, effective_fmt)
 
     # --- Metadata extraction (Feature 1) ---
@@ -744,6 +774,9 @@ async def fetch(
             f"\nSanitization:     {sanitize_mode} "
             f"({len(injection_warnings)} pattern(s) found)"
         )
+    if css_selector:
+        applied_str = "applied" if css_selector_applied else "skipped (non-HTML content)"
+        extra_lines += f"\nCSS selector:     {css_selector!r} ({applied_str})"
 
     summary = (
         f"--- Request Summary ---\n"
