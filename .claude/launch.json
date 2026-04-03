@@ -1,0 +1,9 @@
+{
+  "preview": {
+    "start": {
+      "command": ".venv/bin/python server.py",
+      "port": 8000,
+      "readyMessage": "webfetch startup"
+    }
+  }
+}

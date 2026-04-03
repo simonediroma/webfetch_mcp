@@ -1,0 +1,42 @@
+name: CI
+
+on:
+  push:
+    branches: ["main", "fix/**", "security/**", "tooling/**"]
+  pull_request:
+    branches: ["main"]
+
+jobs:
+  test:
+    name: Test & Lint (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.11", "3.12"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: "pip"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Install dev tools
+        run: pip install ruff mypy bandit pytest-asyncio
+
+      - name: Lint (ruff)
+        run: ruff check server.py tests/
+
+      - name: Type check (mypy)
+        run: mypy server.py --ignore-missing-imports --no-strict-optional
+
+      - name: Security scan (bandit)
+        run: bandit -r server.py -ll
+
+      - name: Run tests
+        run: pytest tests/ -v --tb=short

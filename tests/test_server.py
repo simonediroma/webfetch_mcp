@@ -1432,3 +1432,165 @@ class TestTlsConfig:
         assert verify is True
         assert ca_bundle is None
         assert min_version is None
+
+
+# ---------------------------------------------------------------------------
+# Phase 4 — missing tests for public tool parameters
+# ---------------------------------------------------------------------------
+
+class TestAssertStatus:
+    """assert_status parameter: raises ValueError on mismatch."""
+
+    @pytest.fixture(autouse=True)
+    def _server(self, monkeypatch):
+        self.server = _reload_server(monkeypatch)
+
+    async def test_assert_status_pass_shows_in_summary(self):
+        response = _make_mock_response(200, "<html>ok</html>")
+        async_cm, _ = _make_async_client_mock(response)
+        with patch("httpx.AsyncClient", return_value=async_cm):
+            result = await self.server.fetch("http://example.com/", assert_status=200)
+        assert "assert_status:    200 (passed)" in result
+
+    async def test_assert_status_fail_raises(self):
+        response = _make_mock_response(404, "<html>not found</html>")
+        async_cm, _ = _make_async_client_mock(response)
+        with patch("httpx.AsyncClient", return_value=async_cm):
+            with pytest.raises(ValueError, match="assert_status failed"):
+                await self.server.fetch("http://example.com/", assert_status=200)
+
+    async def test_assert_status_none_does_not_add_line(self):
+        response = _make_mock_response(200, "<html>ok</html>")
+        async_cm, _ = _make_async_client_mock(response)
+        with patch("httpx.AsyncClient", return_value=async_cm):
+            result = await self.server.fetch("http://example.com/")
+        assert "assert_status" not in result
+
+
+class TestAssertContains:
+    """assert_contains parameter: raises ValueError when string absent."""
+
+    @pytest.fixture(autouse=True)
+    def _server(self, monkeypatch):
+        self.server = _reload_server(monkeypatch)
+
+    async def test_assert_contains_pass_shows_in_summary(self):
+        response = _make_mock_response(200, "<html>hello world</html>")
+        async_cm, _ = _make_async_client_mock(response)
+        with patch("httpx.AsyncClient", return_value=async_cm):
+            result = await self.server.fetch(
+                "http://example.com/", assert_contains="hello"
+            )
+        assert "assert_contains" in result
+        assert "passed" in result
+
+    async def test_assert_contains_fail_raises(self):
+        response = _make_mock_response(200, "<html>hello world</html>")
+        async_cm, _ = _make_async_client_mock(response)
+        with patch("httpx.AsyncClient", return_value=async_cm):
+            with pytest.raises(ValueError, match="assert_contains failed"):
+                await self.server.fetch(
+                    "http://example.com/", assert_contains="not-present"
+                )
+
+    async def test_assert_contains_none_does_not_add_line(self):
+        response = _make_mock_response(200, "<html>ok</html>")
+        async_cm, _ = _make_async_client_mock(response)
+        with patch("httpx.AsyncClient", return_value=async_cm):
+            result = await self.server.fetch("http://example.com/")
+        assert "assert_contains" not in result
+
+
+class TestTraceRedirects:
+    """trace_redirects parameter: redirect chain appears in summary."""
+
+    @pytest.fixture(autouse=True)
+    def _server(self, monkeypatch):
+        self.server = _reload_server(monkeypatch)
+
+    async def test_trace_redirects_shows_none_when_no_redirects(self):
+        response = _make_mock_response(200, "<html>final</html>")
+        response.history = []
+        async_cm, _ = _make_async_client_mock(response)
+        with patch("httpx.AsyncClient", return_value=async_cm):
+            result = await self.server.fetch(
+                "http://example.com/", trace_redirects=True
+            )
+        assert "Redirect chain:   none" in result
+
+    async def test_trace_redirects_shows_chain_when_redirected(self):
+        # Build a mock redirect hop
+        redirect_hop = MagicMock()
+        redirect_hop.status_code = 301
+        redirect_hop.url = "http://example.com/"
+        redirect_hop.headers = {"location": "http://www.example.com/"}
+
+        response = _make_mock_response(200, "<html>final</html>")
+        response.history = [redirect_hop]
+        response.url = "http://www.example.com/"
+        async_cm, _ = _make_async_client_mock(response)
+        with patch("httpx.AsyncClient", return_value=async_cm):
+            result = await self.server.fetch(
+                "http://example.com/", trace_redirects=True
+            )
+        assert "Redirect chain:" in result
+        assert "301" in result
+
+    async def test_trace_redirects_disabled_by_default(self):
+        response = _make_mock_response(200, "<html>ok</html>")
+        response.history = []
+        async_cm, _ = _make_async_client_mock(response)
+        with patch("httpx.AsyncClient", return_value=async_cm):
+            result = await self.server.fetch("http://example.com/")
+        assert "Redirect chain" not in result
+
+
+class TestFollowRedirectsFalse:
+    """follow_redirects=False: redirect response returned without following."""
+
+    @pytest.fixture(autouse=True)
+    def _server(self, monkeypatch):
+        self.server = _reload_server(monkeypatch)
+
+    async def test_redirect_response_returned_directly(self):
+        response = _make_mock_response(301, "")
+        response.history = []
+        async_cm, _ = _make_async_client_mock(response)
+        with patch("httpx.AsyncClient", return_value=async_cm):
+            result = await self.server.fetch(
+                "http://example.com/", follow_redirects=False
+            )
+        assert "Status:           301" in result
+
+    async def test_follow_redirects_false_passed_to_client(self):
+        response = _make_mock_response(200, "<html>ok</html>")
+        async_cm, client_mock = _make_async_client_mock(response)
+        with patch("httpx.AsyncClient", return_value=async_cm) as mock_cls:
+            await self.server.fetch("http://example.com/", follow_redirects=False)
+        call_kwargs = mock_cls.call_args[1]
+        assert call_kwargs["follow_redirects"] is False
+
+
+class TestCssSelectorWithOutputFormat:
+    """CSS selector combined with output_format conversion."""
+
+    @pytest.fixture(autouse=True)
+    def _server(self, monkeypatch):
+        self.server = _reload_server(monkeypatch)
+
+    async def test_css_selector_then_markdown(self):
+        """Content extracted by CSS selector must be passed through markdownify."""
+        html = "<html><body><article><h1>Title</h1><p>Body text</p></article></body></html>"
+        response = _make_mock_response(200, html)
+        async_cm, _ = _make_async_client_mock(response)
+        with patch("httpx.AsyncClient", return_value=async_cm):
+            result = await self.server.fetch(
+                "http://example.com/",
+                css_selector="article",
+                output_format="markdown",
+            )
+        # Both selector and format must appear in summary
+        assert "applied" in result
+        assert "Output format:    markdown" in result
+        # Markdown heading must be present in the body
+        assert "Title" in result

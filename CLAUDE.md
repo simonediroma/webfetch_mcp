@@ -122,10 +122,13 @@ fetch(
     body: str | None = None,     # request body for POST/PUT
     extra_headers: dict | None,  # per-call headers (merged on top)
     extract_text: bool = False,  # legacy: strip HTML → clean text (wins over output_format)
-    max_bytes: int = 0,          # truncate response (0 = unlimited)
+    max_bytes: int = 0,          # 0 = apply default 10 MB cap; -1 = no cap; >0 = explicit cap
     follow_redirects: bool = True,
-    output_format: str | None,   # "raw" | "markdown" | "trafilatura" — overrides WEBFETCH_OUTPUT
+    output_format: str | None,   # "raw" | "markdown" | "trafilatura" | "json"
     css_selector: str | None,    # CSS selector to extract HTML element(s) before format conversion
+    trace_redirects: bool = False,  # include full redirect chain in summary
+    assert_status: int | None,   # raise ValueError if status code doesn't match
+    assert_contains: str | None, # raise ValueError if string not found in body
 ) -> str
 ```
 
@@ -155,6 +158,19 @@ No HTTP port is used in production mode.
 For Claude Code's `preview_start` (dev only), port 8000 is declared in
 `.claude/launch.json`. On Mac/Linux update `runtimeExecutable` to
 `.venv/bin/python`.
+
+---
+
+## Configuration precedence
+
+When `WEBFETCH_CONFIG` is set, the YAML file is loaded and the legacy env vars
+(`WEBFETCH_HEADERS`, `WEBFETCH_OUTPUT`, `WEBFETCH_SELECTORS`) are **ignored entirely**.
+
+When `WEBFETCH_CONFIG` is not set, only the three legacy env vars are read.
+Features available exclusively via YAML (not accessible through env vars):
+`timeout`, `retry`, `proxy`, `bot_block_detection`, `sanitize_content`,
+`extract_metadata`, `tls_verify`, `tls_ca_bundle`, `tls_min_version`,
+`allowed_domains`, `denied_domains`.
 
 ---
 
