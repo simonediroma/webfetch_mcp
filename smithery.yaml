@@ -1,0 +1,4 @@
+name: webfetch_mcp
+description: Drop-in WebFetch MCP replacement with domain-scoped HTTP headers injection for authentication
+homepage: https://github.com/simonediroma/webfetch_mcp
+license: MIT

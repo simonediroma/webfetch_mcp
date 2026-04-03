@@ -21,7 +21,7 @@ Passing `output_format="raw"` or `extract_text=True` overrides that configured d
 
 Local Python MCP server that replaces Claude's built-in WebFetch tool.
 Main purpose: inject **domain-scoped custom HTTP headers** into every outbound request,
-used to authenticate against Akamai bot-defender on specific domains.
+used to inject provider-specific authentication headers on specific domains.
 
 ---
 
@@ -61,7 +61,7 @@ cp .env.example .env   # then edit .env with real tokens
 `WEBFETCH_HEADERS` is a **single-line JSON object** with domain-scoped headers:
 
 ```env
-WEBFETCH_HEADERS={"*": {"User-Agent": "MyBot/1.0"}, "example.com": {"X-Akamai-Token": "TOKEN"}}
+WEBFETCH_HEADERS={"*": {"User-Agent": "MyBot/1.0"}, "example.com": {"X-Auth-Token": "TOKEN"}}
 ```
 
 | Key | Meaning |
@@ -86,6 +86,27 @@ WEBFETCH_OUTPUT={"*": "raw", "example.com": "trafilatura", "news.com": "markdown
 | `"trafilatura"` | Extract main content and return as Markdown via `trafilatura` (falls back to raw if extraction fails) |
 
 Merge order (later wins): `*` → domain-specific → per-call `output_format` parameter.
+
+### `WEBFETCH_SELECTORS` — domain-scoped CSS selector
+
+`WEBFETCH_SELECTORS` is a **single-line JSON object** specifying a CSS selector per domain.
+The selector is applied to the raw HTML **before** any output format conversion, so only the
+matched element(s) are passed to `markdownify` / `trafilatura` / etc.
+
+```env
+WEBFETCH_SELECTORS={"example.com": "article.main-content", "news.com": "div#article-body"}
+```
+
+| Key | Meaning |
+|-----|---------|
+| `"*"` | Applied to **every** response (global) |
+| `"example.com"` | Applied only when hostname ends with `example.com` |
+
+- All elements matching the selector are concatenated as HTML.
+- If the selector matches nothing, the full HTML is used as fallback (with a warning logged).
+- Uses `beautifulsoup4` with Python's built-in `html.parser` (lazy import).
+
+Merge order (later wins): `*` → domain-specific → per-call `css_selector` parameter.
 
 ---
 
@@ -120,16 +141,20 @@ fetch(
     body: str | None = None,     # request body for POST/PUT
     extra_headers: dict | None,  # per-call headers (merged on top)
     extract_text: bool = False,  # legacy: strip HTML → clean text (wins over output_format)
-    max_bytes: int = 0,          # truncate response (0 = unlimited)
+    max_bytes: int = 0,          # 0 = apply default 10 MB cap; -1 = no cap; >0 = explicit cap
     follow_redirects: bool = True,
-    output_format: str | None,   # "raw" | "markdown" | "trafilatura" — overrides WEBFETCH_OUTPUT
+    output_format: str | None,   # "raw" | "markdown" | "trafilatura" | "json"
+    css_selector: str | None,    # CSS selector to extract HTML element(s) before format conversion
+    trace_redirects: bool = False,  # include full redirect chain in summary
+    assert_status: int | None,   # raise ValueError if status code doesn't match
+    assert_contains: str | None, # raise ValueError if string not found in body
 ) -> str
 ```
 
 Response format:
 ```
 Status: 200
-Injected headers: User-Agent, X-Akamai-Token
+Injected headers: User-Agent, X-Auth-Token
 
 <body>
 ```
@@ -155,6 +180,19 @@ For Claude Code's `preview_start` (dev only), port 8000 is declared in
 
 ---
 
+## Configuration precedence
+
+When `WEBFETCH_CONFIG` is set, the YAML file is loaded and the legacy env vars
+(`WEBFETCH_HEADERS`, `WEBFETCH_OUTPUT`, `WEBFETCH_SELECTORS`) are **ignored entirely**.
+
+When `WEBFETCH_CONFIG` is not set, only the three legacy env vars are read.
+Features available exclusively via YAML (not accessible through env vars):
+`timeout`, `retry`, `proxy`, `bot_block_detection`, `sanitize_content`,
+`extract_metadata`, `tls_verify`, `tls_ca_bundle`, `tls_min_version`,
+`allowed_domains`, `denied_domains`.
+
+---
+
 ## Key implementation notes (`server.py`)
 
 - `_load_header_config()` — parses `WEBFETCH_HEADERS` at startup; raises `RuntimeError` on invalid JSON.
@@ -165,6 +203,8 @@ For Claude Code's `preview_start` (dev only), port 8000 is declared in
 - `_resolve_output_format(hostname, per_call_format)` — same domain-matching logic as headers; returns effective format string.
 - `_apply_output_format(content, fmt)` — dispatches to `markdownify` or `trafilatura` based on format; uses lazy imports.
 - `_extract_text(html)` — regex tag stripping + whitespace collapse (internal, used by legacy `extract_text=True`).
+- `_resolve_css_selector(hostname, per_call_selector)` — same domain-matching logic; returns effective CSS selector string or `None`.
+- `_apply_css_selector(html, selector)` — extracts matching elements via `BeautifulSoup.select()`; concatenates outer HTML of all matches; falls back to full HTML if nothing matches. Applied **before** `_apply_output_format`.
 - Uses `httpx.AsyncClient` with `follow_redirects=True`.
 
 ---
@@ -178,3 +218,4 @@ For Claude Code's `preview_start` (dev only), port 8000 is declared in
 | `python-dotenv` | Load `.env` at startup |
 | `markdownify` | HTML → Markdown conversion for `"markdown"` output format |
 | `trafilatura` | Main content extraction for `"trafilatura"` output format |
+| `beautifulsoup4` | CSS selector–based HTML element extraction for `css_selector` |
