@@ -13,6 +13,7 @@ import json
 import logging
 import os
 import re
+import time
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -601,6 +602,9 @@ async def fetch(
     follow_redirects: bool = True,
     output_format: str | None = None,
     css_selector: str | None = None,
+    trace_redirects: bool = False,
+    assert_status: int | None = None,
+    assert_contains: str | None = None,
 ) -> str:
     """
     Fetch a URL and return its response, injecting domain-scoped authentication
@@ -626,6 +630,14 @@ async def fetch(
                           elements are concatenated.  Overrides the domain-
                           scoped css_selector from config for this request only.
                           Only applied when Content-Type indicates HTML.
+        trace_redirects:  If True, record and display the full redirect chain
+                          (each hop's status code and URL) in the summary.
+                          Requires follow_redirects=True (default).
+        assert_status:    If set, raise an error when the final response status
+                          code does not match this value. Useful for CI/CD
+                          smoke tests (e.g. assert_status=200).
+        assert_contains:  If set, raise an error when this string is not found
+                          in the response body. Case-sensitive.
     """
     parsed = urlparse(url)
     hostname = parsed.hostname or ""
@@ -667,6 +679,7 @@ async def fetch(
     last_exc: Exception | None = None
     delay = 1.0
     actual_attempts = 0
+    request_start = time.monotonic()
 
     async with httpx.AsyncClient(**client_kwargs) as client:
         for attempt in range(attempts):
@@ -702,6 +715,8 @@ async def fetch(
                         method.upper(), url, attempts, exc,
                     )
                     raise
+
+    elapsed_ms = int((time.monotonic() - request_start) * 1000)
 
     if response is None:
         # Should not happen, but satisfy type checker
@@ -754,6 +769,16 @@ async def fetch(
                 except (httpx.TransportError, httpx.TimeoutException) as exc:
                     _log.warning("Chrome UA retry failed: %s", exc)
 
+    # --- Redirect chain ---
+    redirect_chain_str: str | None = None
+    if trace_redirects and response.history:
+        lines = [
+            f"  {r.status_code}  {r.url}  →  {r.headers.get('location', '?')}"
+            for r in response.history
+        ]
+        lines.append(f"  {response.status_code}  {response.url}  (final)")
+        redirect_chain_str = "\n".join(lines)
+
     # Detect JSON from Content-Type when no explicit format is set
     content_type = response.headers.get("content-type", "")
     effective_fmt: str
@@ -783,6 +808,19 @@ async def fetch(
 
     if max_bytes > 0:
         content = content[:max_bytes]
+
+    # --- Response assertions ---
+    assertion_failures: list[str] = []
+    if assert_status is not None and response.status_code != assert_status:
+        assertion_failures.append(
+            f"assert_status failed: expected {assert_status}, got {response.status_code}"
+        )
+    if assert_contains is not None and assert_contains not in content:
+        assertion_failures.append(
+            f"assert_contains failed: {assert_contains!r} not found in response body"
+        )
+    if assertion_failures:
+        raise ValueError("Assertion failed: " + "; ".join(assertion_failures))
 
     # --- Prompt-injection sanitization (Feature 2) ---
     sanitize_mode = _resolve_sanitize_content(hostname)
@@ -818,6 +856,15 @@ async def fetch(
     if effective_selector:
         applied_str = "applied" if css_selector_applied else "skipped (non-HTML content)"
         extra_lines += f"\nCSS selector:     {effective_selector!r} ({applied_str})"
+    if trace_redirects:
+        if redirect_chain_str:
+            extra_lines += f"\nRedirect chain:\n{redirect_chain_str}"
+        else:
+            extra_lines += "\nRedirect chain:   none (no redirects)"
+    if assert_status is not None:
+        extra_lines += f"\nassert_status:    {assert_status} (passed)"
+    if assert_contains is not None:
+        extra_lines += f"\nassert_contains:  {assert_contains!r} (passed)"
 
     summary = (
         f"--- Request Summary ---\n"
@@ -825,6 +872,7 @@ async def fetch(
         f"Method:           {method.upper()}\n"
         f"Injected headers: {injected}\n"
         f"Status:           {response.status_code} {response.reason_phrase}\n"
+        f"Elapsed:          {elapsed_ms}ms\n"
         f"Response size:    {response_size} bytes\n"
         f"Output format:    {effective_fmt}\n"
         f"Text extracted:   {'yes' if extract_text else 'no'}\n"
