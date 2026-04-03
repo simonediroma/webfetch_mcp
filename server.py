@@ -9,11 +9,13 @@ back to the legacy WEBFETCH_HEADERS / WEBFETCH_OUTPUT environment variables.
 """
 
 import asyncio
+import datetime
 import ipaddress
 import json
 import logging
 import os
 import re
+import ssl
 import time
 from pathlib import Path
 from urllib.parse import urlparse
@@ -26,6 +28,12 @@ load_dotenv()
 
 mcp = FastMCP("webfetch")
 _log = logging.getLogger(__name__)
+
+# Dedicated audit logger.  Enabled by setting WEBFETCH_AUDIT_LOG=1 at startup.
+# Each record is emitted as a single JSON line on the "webfetch.audit" logger,
+# making it easy to pipe into a SIEM or structured log aggregator.
+_audit_log = logging.getLogger("webfetch.audit")
+_AUDIT_ENABLED: bool = os.getenv("WEBFETCH_AUDIT_LOG", "").strip() in ("1", "true", "yes")
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -78,7 +86,61 @@ _DEFAULT_GLOBAL: dict = {
     "css_selector": None,
     "allowed_domains": [],
     "denied_domains": [],
+    "tls_verify": True,
+    "tls_ca_bundle": None,
+    "tls_min_version": None,
 }
+
+# ---------------------------------------------------------------------------
+# Audit logging
+# ---------------------------------------------------------------------------
+
+def _emit_audit_event(event: dict) -> None:
+    """Emit a structured JSON audit record if audit logging is enabled.
+
+    Each call appends a UTC timestamp and logs a single JSON line to the
+    ``webfetch.audit`` logger.  Downstream operators can attach a file
+    handler or forward to a SIEM by configuring Python logging externally.
+    """
+    if not _AUDIT_ENABLED:
+        return
+    event["ts"] = datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+    _audit_log.info(json.dumps(event, ensure_ascii=False))
+
+
+# ---------------------------------------------------------------------------
+# TLS helpers
+# ---------------------------------------------------------------------------
+
+_VALID_TLS_VERSIONS = {"1.2", "1.3"}
+
+
+def _build_ssl_context(
+    ca_bundle: str | None,
+    min_version: str | None,
+    verify: bool,
+) -> ssl.SSLContext | bool:
+    """Build an ssl.SSLContext for httpx from TLS config settings.
+
+    Returns a configured ``ssl.SSLContext`` when any TLS option is set,
+    or the plain ``verify`` boolean otherwise (httpx default behaviour).
+    """
+    if not verify:
+        _log.warning("TLS certificate verification is DISABLED — do not use in production")
+        return False
+
+    if ca_bundle is None and min_version is None:
+        return True  # use httpx default (system trust store, no version pin)
+
+    ctx = ssl.create_default_context(cafile=ca_bundle)
+
+    if min_version == "1.2":
+        ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+    elif min_version == "1.3":
+        ctx.minimum_version = ssl.TLSVersion.TLSv1_3
+
+    return ctx
+
 
 # ---------------------------------------------------------------------------
 # SSRF protection
@@ -308,6 +370,27 @@ def _merge_domain_section(target: dict, source: dict, *, context: str) -> None:
         val = source["css_selector"]
         target["css_selector"] = str(val) if val is not None else None
 
+    if "tls_verify" in source:
+        val = source["tls_verify"]
+        if not isinstance(val, bool):
+            raise RuntimeError(
+                f"'{context}.tls_verify' must be a boolean, got {type(val).__name__!r}"
+            )
+        target["tls_verify"] = val
+
+    if "tls_ca_bundle" in source:
+        val = source["tls_ca_bundle"]
+        target["tls_ca_bundle"] = str(val) if val is not None else None
+
+    if "tls_min_version" in source:
+        val = source["tls_min_version"]
+        if val not in _VALID_TLS_VERSIONS:
+            raise RuntimeError(
+                f"'{context}.tls_min_version' is {val!r}; "
+                f"must be one of {sorted(_VALID_TLS_VERSIONS)}"
+            )
+        target["tls_min_version"] = val
+
     for list_key in ("allowed_domains", "denied_domains"):
         if list_key in source:
             val = source[list_key]
@@ -535,6 +618,24 @@ def _resolve_bot_block_detection(hostname: str) -> str | bool:
         if "bot_block_detection" in domain:
             val = domain["bot_block_detection"]
     return val
+
+
+def _resolve_tls_config(hostname: str) -> tuple[bool, str | None, str | None]:
+    """Return (tls_verify, ca_bundle, min_version) for *hostname*."""
+    verify: bool = _CONFIG["global"].get("tls_verify", True)
+    ca_bundle: str | None = _CONFIG["global"].get("tls_ca_bundle")
+    min_version: str | None = _CONFIG["global"].get("tls_min_version")
+
+    for key in _matching_domain_keys(hostname, _CONFIG["domains"]):
+        domain = _CONFIG["domains"][key]
+        if "tls_verify" in domain:
+            verify = domain["tls_verify"]
+        if "tls_ca_bundle" in domain:
+            ca_bundle = domain["tls_ca_bundle"]
+        if "tls_min_version" in domain:
+            min_version = domain["tls_min_version"]
+
+    return verify, ca_bundle, min_version
 
 
 def _resolve_allowed_denied_domains() -> tuple[list[str], list[str]]:
@@ -811,9 +912,13 @@ async def fetch(
         attempts,
     )
 
+    tls_verify, tls_ca_bundle, tls_min_version = _resolve_tls_config(hostname)
+    ssl_context = _build_ssl_context(tls_ca_bundle, tls_min_version, tls_verify)
+
     client_kwargs: dict = {
         "follow_redirects": follow_redirects,
         "timeout": timeout,
+        "verify": ssl_context,
     }
     if proxy:
         client_kwargs["proxy"] = proxy
@@ -1051,6 +1156,20 @@ async def fetch(
         f"{extra_lines}\n"
         f"---"
     )
+    _emit_audit_event({
+        "event": "fetch",
+        "url": url,
+        "hostname": hostname,
+        "method": method.upper(),
+        "status": response.status_code,
+        "elapsed_ms": elapsed_ms,
+        "response_bytes": response_size,
+        "output_format": effective_fmt,
+        "headers_injected": applied_header_names,
+        "proxy": proxy,
+        "retry_attempt": actual_attempts,
+        "bot_blocked": bot_block_reason,
+    })
     return f"{summary}\n\n{content}"
 
 

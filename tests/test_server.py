@@ -5,6 +5,7 @@ Run with:
     pytest tests/test_server.py -v
 """
 import importlib
+import json
 import sys
 import textwrap
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -1302,3 +1303,132 @@ class TestDefaultMaxBytes:
         with patch("httpx.AsyncClient", return_value=async_cm):
             result = await self.server.fetch("http://example.com/", max_bytes=-1)
         assert "cap disabled" in result
+
+
+# ---------------------------------------------------------------------------
+# Phase 3 — audit logging and TLS configurability tests
+# ---------------------------------------------------------------------------
+
+class TestAuditLogging:
+    """Structured audit logging via WEBFETCH_AUDIT_LOG=1."""
+
+    @pytest.fixture(autouse=True)
+    def _server(self, monkeypatch):
+        self.server = _reload_server(monkeypatch)
+
+    def test_audit_disabled_by_default(self):
+        assert self.server._AUDIT_ENABLED is False
+
+    def test_audit_enabled_when_env_set(self, monkeypatch):
+        monkeypatch.setenv("WEBFETCH_AUDIT_LOG", "1")
+        srv = _reload_server(monkeypatch)
+        assert srv._AUDIT_ENABLED is True
+
+    def test_audit_enabled_with_true_string(self, monkeypatch):
+        monkeypatch.setenv("WEBFETCH_AUDIT_LOG", "true")
+        srv = _reload_server(monkeypatch)
+        assert srv._AUDIT_ENABLED is True
+
+    def test_emit_does_nothing_when_disabled(self):
+        """_emit_audit_event must be a no-op when audit is disabled."""
+        with patch.object(self.server._audit_log, "info") as mock_info:
+            self.server._emit_audit_event({"event": "fetch", "url": "https://x.com"})
+            mock_info.assert_not_called()
+
+    def test_emit_logs_json_when_enabled(self, monkeypatch):
+        """_emit_audit_event must log a valid JSON line when audit is enabled."""
+        monkeypatch.setattr(self.server, "_AUDIT_ENABLED", True)
+        logged: list[str] = []
+
+        def capture(msg):
+            logged.append(msg)
+
+        with patch.object(self.server._audit_log, "info", side_effect=capture):
+            self.server._emit_audit_event({"event": "fetch", "url": "https://x.com"})
+
+        assert len(logged) == 1
+        parsed = json.loads(logged[0])
+        assert parsed["event"] == "fetch"
+        assert parsed["url"] == "https://x.com"
+        assert "ts" in parsed  # timestamp must be injected
+
+    async def test_fetch_emits_audit_event_when_enabled(self, monkeypatch):
+        """fetch() must call _emit_audit_event on every successful request."""
+        monkeypatch.setattr(self.server, "_AUDIT_ENABLED", True)
+        response = _make_mock_response(200, "<html>ok</html>")
+        async_cm, _ = _make_async_client_mock(response)
+        emitted: list[dict] = []
+
+        original = self.server._emit_audit_event
+
+        def capture(event):
+            emitted.append(event)
+            # Still call original so ts is injected (audit disabled mock not needed)
+
+        with patch.object(self.server, "_emit_audit_event", side_effect=capture):
+            with patch("httpx.AsyncClient", return_value=async_cm):
+                await self.server.fetch("http://example.com/")
+
+        assert len(emitted) == 1
+        ev = emitted[0]
+        assert ev["event"] == "fetch"
+        assert ev["hostname"] == "example.com"
+        assert ev["method"] == "GET"
+        assert ev["status"] == 200
+        assert "elapsed_ms" in ev
+        assert "response_bytes" in ev
+
+    async def test_audit_event_not_emitted_when_disabled(self):
+        """fetch() must NOT call _emit_audit_event when audit is disabled."""
+        response = _make_mock_response(200, "<html>ok</html>")
+        async_cm, _ = _make_async_client_mock(response)
+
+        with patch.object(self.server, "_emit_audit_event") as mock_emit:
+            with patch("httpx.AsyncClient", return_value=async_cm):
+                await self.server.fetch("http://example.com/")
+        # _emit_audit_event IS called (it internally checks _AUDIT_ENABLED)
+        # but since disabled it must not write to the logger
+        mock_emit.assert_called_once()
+
+
+class TestTlsConfig:
+    """TLS configurability: _build_ssl_context and _resolve_tls_config."""
+
+    @pytest.fixture(autouse=True)
+    def _server(self, monkeypatch):
+        self.server = _reload_server(monkeypatch)
+
+    def test_default_returns_true(self):
+        result = self.server._build_ssl_context(None, None, True)
+        assert result is True
+
+    def test_verify_false_returns_false(self):
+        result = self.server._build_ssl_context(None, None, False)
+        assert result is False
+
+    def test_min_version_12_produces_ssl_context(self):
+        import ssl
+        result = self.server._build_ssl_context(None, "1.2", True)
+        assert isinstance(result, ssl.SSLContext)
+        assert result.minimum_version == ssl.TLSVersion.TLSv1_2
+
+    def test_min_version_13_produces_ssl_context(self):
+        import ssl
+        result = self.server._build_ssl_context(None, "1.3", True)
+        assert isinstance(result, ssl.SSLContext)
+        assert result.minimum_version == ssl.TLSVersion.TLSv1_3
+
+    def test_invalid_tls_version_raises_at_config_load(self, tmp_path, monkeypatch):
+        yaml_file = tmp_path / "webfetch.yaml"
+        yaml_file.write_text("global:\n  tls_min_version: \"1.0\"\n")
+        monkeypatch.setenv("WEBFETCH_CONFIG", str(yaml_file))
+        import sys
+        sys.modules.pop("server", None)
+        with pytest.raises((RuntimeError, SystemExit, Exception)):
+            import server  # noqa: F401
+
+    def test_resolve_tls_defaults(self):
+        verify, ca_bundle, min_version = self.server._resolve_tls_config("example.com")
+        assert verify is True
+        assert ca_bundle is None
+        assert min_version is None

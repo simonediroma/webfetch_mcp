@@ -44,6 +44,21 @@ global:
   # Outbound HTTP proxy URL (null = no proxy, default)
   proxy: null
 
+  # TLS configuration — useful in enterprise environments with custom CAs or
+  # TLS-intercepting proxies.
+  #
+  # tls_verify:      Set to false ONLY in development environments to skip cert
+  #                  verification.  Always true in production.  Default: true.
+  # tls_ca_bundle:   Absolute path to a PEM CA bundle.  Use when your network
+  #                  uses a corporate CA not in the system trust store (e.g.
+  #                  Zscaler, Palo Alto SSL inspection).
+  # tls_min_version: Minimum TLS version: "1.2" or "1.3".  Default: system
+  #                  default (varies by OS/Python version).
+  #
+  # tls_verify: true
+  # tls_ca_bundle: "/etc/ssl/certs/corporate-ca.pem"
+  # tls_min_version: "1.2"
+
   # SSRF / egress filtering — optional but recommended in enterprise deployments.
   #
   # allowed_domains: if non-empty, ONLY these domains (and their subdomains) may
