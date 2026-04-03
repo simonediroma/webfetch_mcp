@@ -1,6 +1,6 @@
 # WebFetch MCP Server
 
-Local Python MCP server that replaces Claude's built-in WebFetch tool.
+Local Python MCP server — drop-in replacement for built-in WebFetch tools.
 Main purpose: inject **domain-scoped custom HTTP headers** into every outbound request,
 used to inject provider-specific authentication headers on specific domains.
 

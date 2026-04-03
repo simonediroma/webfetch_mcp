@@ -1,12 +1,12 @@
 # webfetch-mcp
 
-A local Python MCP server that replaces Claude's built-in `WebFetch` tool with a fully configurable HTTP client — supporting **domain-scoped headers, retries, proxies, timeouts, output formats, bot-block detection, and prompt-injection sanitization**, all without touching a single line of Claude's config beyond registering the server.
+A local Python MCP server that replaces your MCP client's built-in `WebFetch` tool with a fully configurable HTTP client — supporting **domain-scoped headers, retries, proxies, timeouts, output formats, bot-block detection, and prompt-injection sanitization**, all without touching a single line of your client's config beyond registering the server.
 
 ## Why
 
-Claude's built-in `WebFetch` sends requests without custom headers, which means it gets blocked by bot-protection systems (Akamai, Cloudflare, paywalls, etc.) and can't authenticate against APIs that require domain-specific tokens.
+The built-in `WebFetch` tool available in most MCP clients sends requests without custom headers, which means it gets blocked by bot-protection systems (Akamai, Cloudflare, paywalls, etc.) and can't authenticate against APIs that require domain-specific tokens.
 
-This server is a drop-in replacement: it exposes the same `fetch` tool to Claude, but enriches every outbound request with the right headers, format, and retry strategy based on the target domain — automatically, without you having to ask Claude to add headers every time.
+This server is a drop-in replacement: it exposes the same `fetch` tool to any MCP client, but enriches every outbound request with the right headers, format, and retry strategy based on the target domain — automatically, without you having to configure headers every time.
 
 ---
 
@@ -15,7 +15,7 @@ This server is a drop-in replacement: it exposes the same `fetch` tool to Claude
 | Feature | Description |
 |---------|-------------|
 | **Domain-scoped headers** | Different auth headers per domain; global `*` fallback |
-| **Per-call headers** | Claude (or you) can inject extra headers for a single request |
+| **Per-call headers** | The client (or you) can inject extra headers for a single request |
 | **YAML config** | Single readable file controls headers, timeouts, retries, proxies, and output formats |
 | **Configurable timeout** | Per-domain request timeout (default 30 s) |
 | **Retry with backoff** | Auto-retry on HTTP 5xx or network errors, with exponential backoff |
@@ -29,7 +29,7 @@ This server is a drop-in replacement: it exposes the same `fetch` tool to Claude
 | **Redirect tracing** | Optionally record and display the full redirect chain in the summary |
 | **Response assertions** | `assert_status` / `assert_contains` raise an error on mismatch — useful for CI/CD smoke tests |
 | **Header injection protection** | Validates headers for control characters (`\r`, `\n`, NUL) |
-| **Response truncation** | `max_bytes` cap to avoid filling Claude's context window |
+| **Response truncation** | `max_bytes` cap to avoid filling the client's context window |
 | **Detailed response summary** | Every response includes a structured summary (status, elapsed ms, injected headers, format, etc.) |
 
 ---
@@ -37,7 +37,7 @@ This server is a drop-in replacement: it exposes the same `fetch` tool to Claude
 ## Requirements
 
 - Python 3.10+
-- [Claude Code](https://claude.ai/code) (CLI, desktop app, or IDE extension)
+- Any MCP-compatible client (Claude Code, Cursor, Continue, Zed, etc.)
 
 ---
 
@@ -158,7 +158,11 @@ WEBFETCH_SELECTORS={"example.com": "article.main-content", "news.com": "div#arti
 
 ---
 
-## Registering with Claude Code
+## Registering with your MCP client
+
+Most MCP-compatible clients use a `mcpServers` block in a JSON settings file. The format is the same across clients — only the file location differs.
+
+### Claude Code
 
 Add to `~/.claude/settings.json`:
 
@@ -176,9 +180,76 @@ Add to `~/.claude/settings.json`:
 }
 ```
 
-> **Windows:** use `.venv\Scripts\python.exe`
+### Cursor
 
-Restart Claude Code after saving. The tool appears as **`mcp__webfetch__fetch`** and Claude will use it automatically for web requests.
+Add to `~/.cursor/mcp.json` (or the project-level `.cursor/mcp.json`):
+
+```json
+{
+  "mcpServers": {
+    "webfetch": {
+      "command": "/absolute/path/to/.venv/bin/python",
+      "args": ["/absolute/path/to/server.py"],
+      "env": {
+        "WEBFETCH_CONFIG": "/absolute/path/to/webfetch.yaml"
+      }
+    }
+  }
+}
+```
+
+### Other clients (Continue, Zed, etc.)
+
+Consult your client's MCP documentation for the exact config file location. The server block is the same — only the file path differs.
+
+> **Windows:** use `.venv\Scripts\python.exe` instead of `.venv/bin/python`
+
+Restart your client after saving. The tool is registered as **`mcp__webfetch__fetch`**.
+
+---
+
+## Verifying the server is active
+
+After registering and restarting your client, confirm the tool is loaded:
+
+- **Claude Code**: run `/mcp` in the chat — `webfetch` should appear with status `connected` and `fetch` listed as an available tool.
+- **Cursor**: open **Settings → MCP** and check that `webfetch` appears in the active server list.
+- **Other clients**: look for an MCP tool panel or server list in settings.
+
+If the server doesn't appear, check:
+1. The Python path and `server.py` path in your config are **absolute** and correct.
+2. The virtual environment has all dependencies installed (`pip install -r requirements.txt`).
+3. There are no errors in your YAML/env config — run `python server.py` directly in a terminal to see startup errors on stderr.
+
+---
+
+## Forcing your client to use webfetch instead of the native tool
+
+Most MCP clients expose both their built-in WebFetch and any registered MCP tools. To ensure `mcp__webfetch__fetch` is always preferred:
+
+### Claude Code
+
+Add the following to your project's `CLAUDE.md` (or `~/.claude/CLAUDE.md` to apply it globally to all projects):
+
+```markdown
+Always use the `mcp__webfetch__fetch` tool for all HTTP requests and web browsing.
+Do not use the built-in WebFetch tool.
+```
+
+Alternatively, add a `systemPrompt` entry to `~/.claude/settings.json`:
+
+```json
+{
+  "systemPrompt": "Always use mcp__webfetch__fetch for all web requests. Do not use the built-in WebFetch tool.",
+  "mcpServers": { "...": "..." }
+}
+```
+
+### Other MCP clients
+
+Consult your client's documentation for how to set a system prompt or custom instruction. The instruction to include is:
+
+> Use `mcp__webfetch__fetch` for all web requests instead of any built-in fetch or browser tool.
 
 ---
 
@@ -251,7 +322,7 @@ domains:
     output_format: trafilatura
 ```
 
-Claude now fetches `mysite.com` pages with your session and extracts clean article text automatically.
+The server now fetches `mysite.com` pages with your session and extracts clean article text automatically.
 
 ---
 
@@ -312,11 +383,11 @@ In `report` mode, the summary block flags the block without retrying. In `retry`
 
 ---
 
-### Protect Claude from prompt-injection in untrusted pages
+### Protect against prompt-injection in untrusted pages
 
 ```yaml
 global:
-  sanitize_content: flag    # warn Claude when suspicious patterns are found
+  sanitize_content: flag    # warn when suspicious patterns are found
 
 domains:
   untrusted-forum.com:
@@ -336,7 +407,7 @@ domains:
     output_format: markdown
 ```
 
-Or pass it per-call when asking Claude to fetch a page:
+Or pass it per-call:
 
 ```
 fetch url="https://docs.example.com/guide" css_selector="section#quickstart"
@@ -346,7 +417,7 @@ If the selector matches nothing, the full HTML is used as fallback.
 
 ---
 
-### Smoke test an endpoint from Claude (CI/CD style)
+### Smoke test an endpoint (CI/CD style)
 
 Use `assert_status` and `assert_contains` to make the tool raise an error if the response doesn't match expectations — useful for health checks and regression tests:
 
@@ -354,7 +425,7 @@ Use `assert_status` and `assert_contains` to make the tool raise an error if the
 fetch url="https://api.example.com/health" assert_status=200 assert_contains='"status":"ok"'
 ```
 
-If the check fails, Claude receives a clear `ValueError` instead of silently returning a wrong response.
+If the check fails, the client receives a clear `ValueError` instead of silently returning a wrong response.
 
 ---
 
