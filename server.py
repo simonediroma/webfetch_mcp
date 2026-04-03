@@ -62,7 +62,7 @@ _CHROME_UA = (
 
 _DEFAULT_GLOBAL: dict = {
     "headers": {},
-    "output_format": "raw",
+    "output_format": "trafilatura",
     "timeout": 30.0,
     "retry": {"attempts": 1, "backoff": 2.0},
     "proxy": None,
@@ -559,8 +559,9 @@ async def fetch(
                           0 means no limit.
         follow_redirects: Follow HTTP redirects automatically. Default: True.
         output_format:    Override the output format for this request only.
-                          Accepted values: "raw" (default), "markdown",
-                          "trafilatura", "json".
+                          Accepted values: "raw", "markdown", "trafilatura", "json".
+                          Default is "trafilatura" (clean content extraction).
+                          Only pass "raw" if the user explicitly asks for raw HTML.
                           Ignored if extract_text=True (legacy compat).
     """
     parsed = urlparse(url)
