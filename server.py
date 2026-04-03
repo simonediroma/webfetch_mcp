@@ -297,7 +297,7 @@ def _merge_domain_section(target: dict, source: dict, *, context: str) -> None:
         val = source["headers"]
         if not isinstance(val, dict):
             raise RuntimeError(f"'{context}.headers' must be a mapping")
-        target["headers"] = {str(k): str(v) for k, v in val.items()}
+        target["headers"] = {str(k).lower(): str(v) for k, v in val.items()}
 
     if "output_format" in source:
         val = source["output_format"]
@@ -425,11 +425,16 @@ def _load_env_config() -> dict:
             raise RuntimeError(f"Invalid WEBFETCH_HEADERS: {exc}") from exc
 
         if "*" in header_cfg:
-            config["global"]["headers"] = header_cfg["*"]
+            val = header_cfg["*"]
+            if not isinstance(val, dict):
+                raise RuntimeError("WEBFETCH_HEADERS: value for '*' must be a JSON object")
+            config["global"]["headers"] = {str(k).lower(): str(v) for k, v in val.items()}
         for key, val in header_cfg.items():
             if key == "*":
                 continue
-            config["domains"].setdefault(key, {})["headers"] = val
+            if not isinstance(val, dict):
+                raise RuntimeError(f"WEBFETCH_HEADERS: value for {key!r} must be a JSON object")
+            config["domains"].setdefault(key, {})["headers"] = {str(k).lower(): str(v) for k, v in val.items()}
 
     # --- WEBFETCH_OUTPUT ---
     raw_output = os.getenv("WEBFETCH_OUTPUT", "")
@@ -523,7 +528,7 @@ def _resolve_headers(hostname: str, extra_headers: dict[str, str] | None) -> dic
         headers.update(_CONFIG["domains"][key].get("headers", {}))
 
     if extra_headers:
-        headers.update(extra_headers)
+        headers.update({k.lower(): v for k, v in extra_headers.items()})
 
     return headers
 
@@ -706,7 +711,9 @@ def _apply_output_format(content: str, fmt: str) -> str:
 
 def _extract_text(html: str) -> str:
     """Strip HTML tags and collapse whitespace."""
-    text = re.sub(r"<!--.*?-->", " ", html, flags=re.DOTALL)
+    text = re.sub(r"<script[^>]*>.*?</script>", " ", html, flags=re.DOTALL | re.I)
+    text = re.sub(r"<style[^>]*>.*?</style>", " ", text, flags=re.DOTALL | re.I)
+    text = re.sub(r"<!--.*?-->", " ", text, flags=re.DOTALL)
     text = re.sub(r"<!\[CDATA\[.*?\]\]>", " ", text, flags=re.DOTALL)
     text = re.sub(r"<[^>]+>", " ", text)
     text = re.sub(r"\s+", " ", text)
@@ -863,7 +870,7 @@ async def fetch(
                           default (e.g. trafilatura). Overrides output_format
                           when True, so only set this if you have a specific
                           reason to bypass the configured default.
-        max_bytes:        Truncate the response body to this many characters.
+        max_bytes:        Truncate the response body to this many bytes (UTF-8).
                           0 means no limit.
         follow_redirects: Follow HTTP redirects automatically. Default: True.
         output_format:    Override the output format for this request only.
@@ -1072,8 +1079,12 @@ async def fetch(
     else:
         effective_max_bytes = _DEFAULT_MAX_BYTES
 
+    _was_truncated = False
     if effective_max_bytes > 0:
-        content = content[:effective_max_bytes]
+        encoded = content.encode("utf-8")
+        if len(encoded) > effective_max_bytes:
+            content = encoded[:effective_max_bytes].decode("utf-8", errors="ignore")
+            _was_truncated = True
 
     # --- Response assertions ---
     assertion_failures: list[str] = []
@@ -1101,7 +1112,7 @@ async def fetch(
             content = warning + "\n\n" + content
 
     injected = ", ".join(applied_header_names) if applied_header_names else "none"
-    if effective_max_bytes > 0 and len(content) == effective_max_bytes:
+    if _was_truncated:
         truncated_str = f"yes (cap={effective_max_bytes})"
     elif max_bytes == -1:
         truncated_str = "no (cap disabled)"
