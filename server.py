@@ -1,6 +1,6 @@
 """
 WebFetch MCP Server
-Replaces Claude's built-in WebFetch tool with support for domain-scoped
+Drop-in MCP replacement for built-in WebFetch tools, with support for domain-scoped
 custom HTTP headers (e.g. provider-specific authentication tokens), retry logic,
 configurable timeouts, per-domain proxies, and flexible output formats.
 
