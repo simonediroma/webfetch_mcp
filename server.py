@@ -76,7 +76,7 @@ _CHROME_UA = (
 
 _DEFAULT_GLOBAL: dict = {
     "headers": {},
-    "output_format": "raw",
+    "output_format": "trafilatura",
     "timeout": 30.0,
     "retry": {"attempts": 1, "backoff": 2.0},
     "proxy": None,
@@ -857,16 +857,19 @@ async def fetch(
         body:             Optional request body string (for POST/PUT).
         extra_headers:    Additional headers to send for this request only.
                           Merged on top of the base domain headers.
-        extract_text:     If True, strip HTML tags and return clean readable text.
-                          Legacy parameter — takes priority over output_format.
+        extract_text:     DEPRECATED — do not use. Produces low-quality output
+                          (regex tag-strip with CSS noise). Use output_format
+                          instead, or omit both to use the server's configured
+                          default (e.g. trafilatura). Overrides output_format
+                          when True, so only set this if you have a specific
+                          reason to bypass the configured default.
         max_bytes:        Truncate the response body to this many characters.
                           0 means no limit.
         follow_redirects: Follow HTTP redirects automatically. Default: True.
         output_format:    Override the output format for this request only.
                           Accepted values: "raw", "markdown", "trafilatura", "json".
-                          If omitted, the server's configured default is used (do NOT
-                          pass "raw" unless you explicitly want raw output — omitting
-                          this parameter lets the server configuration take effect).
+                          Default is "trafilatura" (clean content extraction).
+                          Only pass "raw" if the user explicitly asks for raw HTML.
                           Ignored if extract_text=True (legacy compat).
         css_selector:     CSS selector identifying the HTML element(s) to extract
                           before applying the output format.  All matching
