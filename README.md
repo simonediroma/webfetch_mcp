@@ -1,10 +1,10 @@
 # claude-webfetch-mcp
 
-A local Python MCP server that replaces Claude's built-in `WebFetch` tool, adding support for **domain-scoped custom HTTP headers** — useful for authenticating against services like Akamai Bot Manager that require specific headers per domain.
+A local Python MCP server that replaces Claude's built-in `WebFetch` tool, adding support for **domain-scoped custom HTTP headers** — useful for authenticating against services that require custom HTTP headers per domain (e.g. bot protection, API gateways, CDN auth).
 
 ## Why
 
-Claude's built-in WebFetch tool sends requests without custom headers, which means it gets blocked by bot-protection systems (Akamai, etc.). This server acts as a drop-in replacement: it exposes the same `fetch` tool to Claude, but injects the right authentication headers automatically based on the target domain.
+Claude's built-in WebFetch tool sends requests without custom headers, which means it gets blocked by bot-protection systems or services requiring custom headers. This server acts as a drop-in replacement: it exposes the same `fetch` tool to Claude, but injects the right authentication headers automatically based on the target domain.
 
 ## Features
 
@@ -45,7 +45,7 @@ cp .env.example .env
 Edit `.env` — the value must be **a single-line JSON object**:
 
 ```env
-WEBFETCH_HEADERS={"*": {"User-Agent": "MyBot/1.0"}, "example.com": {"X-Akamai-Token": "your-token"}}
+WEBFETCH_HEADERS={"*": {"User-Agent": "MyBot/1.0"}, "example.com": {"X-Auth-Token": "your-token"}}
 ```
 
 ### Header scoping rules
@@ -92,7 +92,7 @@ Restart Claude Code. The tool will be available as `mcp__webfetch__fetch`.
 
 ```
 Status: 200
-Injected headers: User-Agent, X-Akamai-Token
+Injected headers: User-Agent, X-Auth-Token
 
 <!DOCTYPE html>...
 ```
