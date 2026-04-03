@@ -19,7 +19,7 @@ Passing `output_format="raw"` or `extract_text=True` overrides that configured d
 ---
 
 
-Local Python MCP server that replaces Claude's built-in WebFetch tool.
+Local Python MCP server that replaces the AI assistant's built-in WebFetch tool.
 Main purpose: inject **domain-scoped custom HTTP headers** into every outbound request,
 used to inject provider-specific authentication headers on specific domains.
 
