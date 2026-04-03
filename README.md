@@ -1,5 +1,9 @@
 # webfetch-mcp
 
+![Python](https://img.shields.io/badge/python-3.10%2B-blue)
+![License](https://img.shields.io/badge/license-MIT-green)
+![MCP](https://img.shields.io/badge/MCP-compatible-purple)
+
 A local Python MCP server that replaces your AI assistant's built-in `WebFetch` tool with a fully configurable HTTP client — supporting **domain-scoped headers, retries, proxies, timeouts, output formats, bot-block detection, and prompt-injection sanitization**, all without touching a single line of your assistant's config beyond registering the server.
 
 ## Why
@@ -38,6 +42,24 @@ This server is a drop-in replacement: it exposes the same `fetch` tool to any MC
 
 - Python 3.10+
 - Any MCP-compatible AI assistant (Claude Code, Cursor, Continue, Zed, etc.)
+
+---
+
+## Quick start
+
+```bash
+git clone https://github.com/simonediroma/webfetch_mcp.git
+cd webfetch_mcp
+
+# Mac / Linux
+python -m venv .venv && .venv/bin/pip install -r requirements.txt
+# Windows
+python -m venv .venv && .venv\Scripts\pip install -r requirements.txt
+
+cp webfetch.yaml.example webfetch.yaml   # then edit with your tokens
+```
+
+Then [register the server](#registering-with-your-ai-assistant) in your AI assistant config and restart. Done.
 
 ---
 
@@ -197,6 +219,26 @@ Add to `~/.cursor/mcp.json` (or the project-level `.cursor/mcp.json`):
   }
 }
 ```
+
+### Claude Desktop (Mac / Windows)
+
+Add to `~/Library/Application Support/Claude/claude_desktop_config.json` on Mac, or `%APPDATA%\Claude\claude_desktop_config.json` on Windows:
+
+```json
+{
+  "mcpServers": {
+    "webfetch": {
+      "command": "/absolute/path/to/.venv/bin/python",
+      "args": ["/absolute/path/to/server.py"],
+      "env": {
+        "WEBFETCH_CONFIG": "/absolute/path/to/webfetch.yaml"
+      }
+    }
+  }
+}
+```
+
+> **Windows:** use `.venv\Scripts\python.exe` as the `command` value.
 
 ### Other assistants (Continue, Zed, etc.)
 
