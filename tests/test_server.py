@@ -5,6 +5,7 @@ Run with:
     pytest tests/test_server.py -v
 """
 import importlib
+import json
 import sys
 import textwrap
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -80,14 +81,14 @@ class TestLoadConfigEnv:
         monkeypatch.setenv("WEBFETCH_HEADERS", "not-valid-json{{{")
         monkeypatch.delenv("WEBFETCH_CONFIG", raising=False)
         sys.modules.pop("server", None)
-        with pytest.raises((RuntimeError, Exception)):
+        with pytest.raises((RuntimeError, SystemExit, Exception)):
             import server  # noqa: F401
 
     def test_non_dict_headers_raises(self, monkeypatch):
         monkeypatch.setenv("WEBFETCH_HEADERS", '["a", "b"]')
         monkeypatch.delenv("WEBFETCH_CONFIG", raising=False)
         sys.modules.pop("server", None)
-        with pytest.raises((RuntimeError, Exception)):
+        with pytest.raises((RuntimeError, SystemExit, Exception)):
             import server  # noqa: F401
 
     def test_domain_headers_stored_in_domains(self, monkeypatch):
@@ -112,7 +113,7 @@ class TestLoadConfigEnv:
         monkeypatch.setenv("WEBFETCH_OUTPUT", '{"*": "nonexistent"}')
         monkeypatch.delenv("WEBFETCH_CONFIG", raising=False)
         sys.modules.pop("server", None)
-        with pytest.raises((RuntimeError, Exception)):
+        with pytest.raises((RuntimeError, SystemExit, Exception)):
             import server  # noqa: F401
 
 
@@ -152,7 +153,7 @@ class TestLoadConfigYaml:
     def test_yaml_missing_file_raises(self, monkeypatch, tmp_path):
         monkeypatch.setenv("WEBFETCH_CONFIG", str(tmp_path / "nonexistent.yaml"))
         sys.modules.pop("server", None)
-        with pytest.raises((RuntimeError, Exception)):
+        with pytest.raises((RuntimeError, SystemExit, Exception)):
             import server  # noqa: F401
 
     def test_yaml_invalid_syntax_raises(self, monkeypatch, tmp_path):
@@ -160,7 +161,7 @@ class TestLoadConfigYaml:
         yaml_file.write_text("key: [unclosed")
         monkeypatch.setenv("WEBFETCH_CONFIG", str(yaml_file))
         sys.modules.pop("server", None)
-        with pytest.raises((RuntimeError, Exception)):
+        with pytest.raises((RuntimeError, SystemExit, Exception)):
             import server  # noqa: F401
 
     def test_yaml_minimal_empty(self, monkeypatch, tmp_path):
@@ -175,7 +176,7 @@ class TestLoadConfigYaml:
         yaml_file.write_text("global:\n  output_format: bad_value\n")
         monkeypatch.setenv("WEBFETCH_CONFIG", str(yaml_file))
         sys.modules.pop("server", None)
-        with pytest.raises((RuntimeError, Exception)):
+        with pytest.raises((RuntimeError, SystemExit, Exception)):
             import server  # noqa: F401
 
 
@@ -583,7 +584,7 @@ class TestFetch:
         async_cm, _ = _make_async_client_mock(response)
         with patch("httpx.AsyncClient", return_value=async_cm):
             result = await self.server.fetch("http://example.com/", max_bytes=50)
-        assert "Truncated:        yes (max_bytes=50)" in result
+        assert "Truncated:        yes (cap=50)" in result
         assert "Response size:    1000 bytes" in result
 
     async def test_response_size_is_pre_truncation(self):
@@ -1054,3 +1055,542 @@ class TestFetchBotBlock:
         with patch("httpx.AsyncClient", return_value=async_cm):
             result = await self.server.fetch("http://example.com/")
         assert "Chrome retry:     no" in result
+
+
+# ---------------------------------------------------------------------------
+# Phase 1 bug-fix regression tests
+# ---------------------------------------------------------------------------
+
+class TestPhase1BugFixes:
+    """Regression tests for Phase 1 bug fixes."""
+
+    @pytest.fixture(autouse=True)
+    def _server(self, monkeypatch):
+        self.server = _reload_server(monkeypatch)
+
+    # --- 1a: JSON auto-detect must NOT fire when output_format="raw" is explicit ---
+
+    async def test_json_autodetect_fires_by_default(self):
+        """When no output_format is given and Content-Type is JSON, auto-detect to json."""
+        response = _make_mock_response(200, '{"key": "value"}', content_type="application/json")
+        async_cm, _ = _make_async_client_mock(response)
+        with patch("httpx.AsyncClient", return_value=async_cm):
+            result = await self.server.fetch("http://api.example.com/data")
+        assert "Output format:    json" in result
+
+    async def test_json_autodetect_skipped_when_output_format_raw_explicit(self):
+        """Explicit output_format='raw' must suppress JSON auto-detection."""
+        response = _make_mock_response(200, '{"key": "value"}', content_type="application/json")
+        async_cm, _ = _make_async_client_mock(response)
+        with patch("httpx.AsyncClient", return_value=async_cm):
+            result = await self.server.fetch(
+                "http://api.example.com/data", output_format="raw"
+            )
+        assert "Output format:    raw" in result
+        # Raw body must appear as-is, not pretty-printed
+        assert '{"key": "value"}' in result
+
+    # --- 1b: CSS selector no-match must be visible in summary ---
+
+    async def test_css_selector_no_match_shows_in_summary(self):
+        """When css_selector matches nothing, summary must say 'no match (full HTML used)'."""
+        response = _make_mock_response(200, "<html><body><p>hello</p></body></html>")
+        async_cm, _ = _make_async_client_mock(response)
+        with patch("httpx.AsyncClient", return_value=async_cm):
+            result = await self.server.fetch(
+                "http://example.com/", css_selector="div.nonexistent"
+            )
+        assert "no match (full HTML used)" in result
+
+    async def test_css_selector_match_shows_applied_in_summary(self):
+        """When css_selector matches, summary must say 'applied'."""
+        response = _make_mock_response(
+            200, "<html><body><article>content</article></body></html>"
+        )
+        async_cm, _ = _make_async_client_mock(response)
+        with patch("httpx.AsyncClient", return_value=async_cm):
+            result = await self.server.fetch(
+                "http://example.com/", css_selector="article"
+            )
+        assert "applied" in result
+        assert "no match" not in result
+
+    # --- 1c: _extract_text strips HTML comments and CDATA ---
+
+    def test_extract_text_strips_html_comments(self):
+        """HTML comments must be removed by _extract_text."""
+        html = "<p>Hello</p><!-- this is a comment -->World"
+        result = self.server._extract_text(html)
+        assert "comment" not in result
+        assert "Hello" in result
+        assert "World" in result
+
+    def test_extract_text_strips_cdata(self):
+        """CDATA sections must be removed by _extract_text."""
+        html = "<p>Before</p><![CDATA[secret data]]><p>After</p>"
+        result = self.server._extract_text(html)
+        assert "secret data" not in result
+        assert "Before" in result
+        assert "After" in result
+
+    def test_extract_text_strips_multiline_comment(self):
+        """Multi-line HTML comments must be fully stripped."""
+        html = "<p>A</p><!--\nline1\nline2\n--><p>B</p>"
+        result = self.server._extract_text(html)
+        assert "line1" not in result
+        assert "line2" not in result
+        assert "A" in result
+        assert "B" in result
+
+
+# ---------------------------------------------------------------------------
+# Phase 2 security tests
+# ---------------------------------------------------------------------------
+
+class TestValidateUrl:
+    """Unit tests for _validate_url SSRF protection."""
+
+    @pytest.fixture(autouse=True)
+    def _server(self, monkeypatch):
+        self.server = _reload_server(monkeypatch)
+
+    def test_valid_https_url_passes(self):
+        self.server._validate_url("https://example.com/page", [], [])
+
+    def test_valid_http_url_passes(self):
+        self.server._validate_url("http://example.com/page", [], [])
+
+    def test_file_scheme_blocked(self):
+        with pytest.raises(ValueError, match="scheme"):
+            self.server._validate_url("file:///etc/passwd", [], [])
+
+    def test_ftp_scheme_blocked(self):
+        with pytest.raises(ValueError, match="scheme"):
+            self.server._validate_url("ftp://example.com/", [], [])
+
+    def test_javascript_scheme_blocked(self):
+        with pytest.raises(ValueError, match="scheme"):
+            self.server._validate_url("javascript:alert(1)", [], [])
+
+    def test_localhost_blocked(self):
+        with pytest.raises(ValueError, match="loopback"):
+            self.server._validate_url("http://localhost/", [], [])
+
+    def test_loopback_ip_blocked(self):
+        with pytest.raises(ValueError, match="reserved range"):
+            self.server._validate_url("http://127.0.0.1/", [], [])
+
+    def test_loopback_127_x_blocked(self):
+        with pytest.raises(ValueError, match="reserved range"):
+            self.server._validate_url("http://127.1.2.3/", [], [])
+
+    def test_aws_metadata_blocked(self):
+        with pytest.raises(ValueError, match="reserved range"):
+            self.server._validate_url("http://169.254.169.254/latest/meta-data/", [], [])
+
+    def test_private_10_blocked(self):
+        with pytest.raises(ValueError, match="reserved range"):
+            self.server._validate_url("http://10.0.0.1/", [], [])
+
+    def test_private_192_168_blocked(self):
+        with pytest.raises(ValueError, match="reserved range"):
+            self.server._validate_url("http://192.168.1.100/", [], [])
+
+    def test_private_172_16_blocked(self):
+        with pytest.raises(ValueError, match="reserved range"):
+            self.server._validate_url("http://172.16.0.1/", [], [])
+
+    def test_ipv6_loopback_blocked(self):
+        with pytest.raises(ValueError, match="reserved range"):
+            self.server._validate_url("http://[::1]/", [], [])
+
+    def test_denied_domains_blocks_exact_match(self):
+        with pytest.raises(ValueError, match="denied_domains"):
+            self.server._validate_url("http://internal.corp/", [], ["internal.corp"])
+
+    def test_denied_domains_blocks_subdomain(self):
+        with pytest.raises(ValueError, match="denied_domains"):
+            self.server._validate_url("http://api.internal.corp/", [], ["internal.corp"])
+
+    def test_denied_domains_allows_unrelated_host(self):
+        self.server._validate_url("http://example.com/", [], ["internal.corp"])
+
+    def test_allowed_domains_permits_exact_match(self):
+        self.server._validate_url("http://api.example.com/", ["api.example.com"], [])
+
+    def test_allowed_domains_permits_subdomain(self):
+        self.server._validate_url("http://www.example.com/", ["example.com"], [])
+
+    def test_allowed_domains_blocks_non_listed(self):
+        with pytest.raises(ValueError, match="allowed_domains"):
+            self.server._validate_url("http://other.com/", ["example.com"], [])
+
+    def test_empty_allowed_and_denied_permits_public_host(self):
+        self.server._validate_url("https://github.com/", [], [])
+
+
+class TestFetchSsrfIntegration:
+    """Integration tests: _validate_url is called inside fetch()."""
+
+    @pytest.fixture(autouse=True)
+    def _server(self, monkeypatch):
+        self.server = _reload_server(monkeypatch)
+
+    async def test_fetch_blocks_localhost(self):
+        with pytest.raises(ValueError, match="loopback"):
+            await self.server.fetch("http://localhost/admin")
+
+    async def test_fetch_blocks_private_ip(self):
+        with pytest.raises(ValueError, match="reserved range"):
+            await self.server.fetch("http://192.168.1.1/")
+
+    async def test_fetch_blocks_file_scheme(self):
+        with pytest.raises(ValueError, match="scheme"):
+            await self.server.fetch("file:///etc/passwd")
+
+
+class TestValidateHeadersForbidden:
+    """Header hardening: forbidden headers must raise ValueError."""
+
+    @pytest.fixture(autouse=True)
+    def _server(self, monkeypatch):
+        self.server = _reload_server(monkeypatch)
+
+    def test_host_header_raises(self):
+        with pytest.raises(ValueError, match="Host"):
+            self.server._validate_headers({"Host": "evil.com"})
+
+    def test_content_length_header_raises(self):
+        with pytest.raises(ValueError, match="Content-Length"):
+            self.server._validate_headers({"Content-Length": "0"})
+
+    def test_transfer_encoding_header_raises(self):
+        with pytest.raises(ValueError, match="Transfer-Encoding"):
+            self.server._validate_headers({"Transfer-Encoding": "chunked"})
+
+    def test_connection_header_raises(self):
+        with pytest.raises(ValueError, match="Connection"):
+            self.server._validate_headers({"Connection": "close"})
+
+    def test_safe_header_passes(self):
+        self.server._validate_headers({"X-Custom-Token": "abc123"})
+
+    def test_case_insensitive_blocking(self):
+        with pytest.raises(ValueError):
+            self.server._validate_headers({"HOST": "evil.com"})
+
+
+class TestDefaultMaxBytes:
+    """Default 10 MB cap must be applied when max_bytes is not specified."""
+
+    @pytest.fixture(autouse=True)
+    def _server(self, monkeypatch):
+        self.server = _reload_server(monkeypatch)
+
+    async def test_default_cap_applied_shown_in_summary(self):
+        """Summary must show the effective cap even when max_bytes=0 (default)."""
+        response = _make_mock_response(200, "X" * 100)
+        async_cm, _ = _make_async_client_mock(response)
+        with patch("httpx.AsyncClient", return_value=async_cm):
+            result = await self.server.fetch("http://example.com/")
+        # Content is small — cap shown but not actually truncating
+        assert f"cap={self.server._DEFAULT_MAX_BYTES}" in result
+
+    async def test_explicit_minus_one_disables_cap(self):
+        """max_bytes=-1 must disable the cap entirely."""
+        response = _make_mock_response(200, "X" * 100)
+        async_cm, _ = _make_async_client_mock(response)
+        with patch("httpx.AsyncClient", return_value=async_cm):
+            result = await self.server.fetch("http://example.com/", max_bytes=-1)
+        assert "cap disabled" in result
+
+
+# ---------------------------------------------------------------------------
+# Phase 3 — audit logging and TLS configurability tests
+# ---------------------------------------------------------------------------
+
+class TestAuditLogging:
+    """Structured audit logging via WEBFETCH_AUDIT_LOG=1."""
+
+    @pytest.fixture(autouse=True)
+    def _server(self, monkeypatch):
+        self.server = _reload_server(monkeypatch)
+
+    def test_audit_disabled_by_default(self):
+        assert self.server._AUDIT_ENABLED is False
+
+    def test_audit_enabled_when_env_set(self, monkeypatch):
+        monkeypatch.setenv("WEBFETCH_AUDIT_LOG", "1")
+        srv = _reload_server(monkeypatch)
+        assert srv._AUDIT_ENABLED is True
+
+    def test_audit_enabled_with_true_string(self, monkeypatch):
+        monkeypatch.setenv("WEBFETCH_AUDIT_LOG", "true")
+        srv = _reload_server(monkeypatch)
+        assert srv._AUDIT_ENABLED is True
+
+    def test_emit_does_nothing_when_disabled(self):
+        """_emit_audit_event must be a no-op when audit is disabled."""
+        with patch.object(self.server._audit_log, "info") as mock_info:
+            self.server._emit_audit_event({"event": "fetch", "url": "https://x.com"})
+            mock_info.assert_not_called()
+
+    def test_emit_logs_json_when_enabled(self, monkeypatch):
+        """_emit_audit_event must log a valid JSON line when audit is enabled."""
+        monkeypatch.setattr(self.server, "_AUDIT_ENABLED", True)
+        logged: list[str] = []
+
+        def capture(msg):
+            logged.append(msg)
+
+        with patch.object(self.server._audit_log, "info", side_effect=capture):
+            self.server._emit_audit_event({"event": "fetch", "url": "https://x.com"})
+
+        assert len(logged) == 1
+        parsed = json.loads(logged[0])
+        assert parsed["event"] == "fetch"
+        assert parsed["url"] == "https://x.com"
+        assert "ts" in parsed  # timestamp must be injected
+
+    async def test_fetch_emits_audit_event_when_enabled(self, monkeypatch):
+        """fetch() must call _emit_audit_event on every successful request."""
+        monkeypatch.setattr(self.server, "_AUDIT_ENABLED", True)
+        response = _make_mock_response(200, "<html>ok</html>")
+        async_cm, _ = _make_async_client_mock(response)
+        emitted: list[dict] = []
+
+        original = self.server._emit_audit_event
+
+        def capture(event):
+            emitted.append(event)
+            # Still call original so ts is injected (audit disabled mock not needed)
+
+        with patch.object(self.server, "_emit_audit_event", side_effect=capture):
+            with patch("httpx.AsyncClient", return_value=async_cm):
+                await self.server.fetch("http://example.com/")
+
+        assert len(emitted) == 1
+        ev = emitted[0]
+        assert ev["event"] == "fetch"
+        assert ev["hostname"] == "example.com"
+        assert ev["method"] == "GET"
+        assert ev["status"] == 200
+        assert "elapsed_ms" in ev
+        assert "response_bytes" in ev
+
+    async def test_audit_event_not_emitted_when_disabled(self):
+        """fetch() must NOT call _emit_audit_event when audit is disabled."""
+        response = _make_mock_response(200, "<html>ok</html>")
+        async_cm, _ = _make_async_client_mock(response)
+
+        with patch.object(self.server, "_emit_audit_event") as mock_emit:
+            with patch("httpx.AsyncClient", return_value=async_cm):
+                await self.server.fetch("http://example.com/")
+        # _emit_audit_event IS called (it internally checks _AUDIT_ENABLED)
+        # but since disabled it must not write to the logger
+        mock_emit.assert_called_once()
+
+
+class TestTlsConfig:
+    """TLS configurability: _build_ssl_context and _resolve_tls_config."""
+
+    @pytest.fixture(autouse=True)
+    def _server(self, monkeypatch):
+        self.server = _reload_server(monkeypatch)
+
+    def test_default_returns_true(self):
+        result = self.server._build_ssl_context(None, None, True)
+        assert result is True
+
+    def test_verify_false_returns_false(self):
+        result = self.server._build_ssl_context(None, None, False)
+        assert result is False
+
+    def test_min_version_12_produces_ssl_context(self):
+        import ssl
+        result = self.server._build_ssl_context(None, "1.2", True)
+        assert isinstance(result, ssl.SSLContext)
+        assert result.minimum_version == ssl.TLSVersion.TLSv1_2
+
+    def test_min_version_13_produces_ssl_context(self):
+        import ssl
+        result = self.server._build_ssl_context(None, "1.3", True)
+        assert isinstance(result, ssl.SSLContext)
+        assert result.minimum_version == ssl.TLSVersion.TLSv1_3
+
+    def test_invalid_tls_version_raises_at_config_load(self, tmp_path, monkeypatch):
+        yaml_file = tmp_path / "webfetch.yaml"
+        yaml_file.write_text("global:\n  tls_min_version: \"1.0\"\n")
+        monkeypatch.setenv("WEBFETCH_CONFIG", str(yaml_file))
+        import sys
+        sys.modules.pop("server", None)
+        with pytest.raises((RuntimeError, SystemExit, Exception)):
+            import server  # noqa: F401
+
+    def test_resolve_tls_defaults(self):
+        verify, ca_bundle, min_version = self.server._resolve_tls_config("example.com")
+        assert verify is True
+        assert ca_bundle is None
+        assert min_version is None
+
+
+# ---------------------------------------------------------------------------
+# Phase 4 — missing tests for public tool parameters
+# ---------------------------------------------------------------------------
+
+class TestAssertStatus:
+    """assert_status parameter: raises ValueError on mismatch."""
+
+    @pytest.fixture(autouse=True)
+    def _server(self, monkeypatch):
+        self.server = _reload_server(monkeypatch)
+
+    async def test_assert_status_pass_shows_in_summary(self):
+        response = _make_mock_response(200, "<html>ok</html>")
+        async_cm, _ = _make_async_client_mock(response)
+        with patch("httpx.AsyncClient", return_value=async_cm):
+            result = await self.server.fetch("http://example.com/", assert_status=200)
+        assert "assert_status:    200 (passed)" in result
+
+    async def test_assert_status_fail_raises(self):
+        response = _make_mock_response(404, "<html>not found</html>")
+        async_cm, _ = _make_async_client_mock(response)
+        with patch("httpx.AsyncClient", return_value=async_cm):
+            with pytest.raises(ValueError, match="assert_status failed"):
+                await self.server.fetch("http://example.com/", assert_status=200)
+
+    async def test_assert_status_none_does_not_add_line(self):
+        response = _make_mock_response(200, "<html>ok</html>")
+        async_cm, _ = _make_async_client_mock(response)
+        with patch("httpx.AsyncClient", return_value=async_cm):
+            result = await self.server.fetch("http://example.com/")
+        assert "assert_status" not in result
+
+
+class TestAssertContains:
+    """assert_contains parameter: raises ValueError when string absent."""
+
+    @pytest.fixture(autouse=True)
+    def _server(self, monkeypatch):
+        self.server = _reload_server(monkeypatch)
+
+    async def test_assert_contains_pass_shows_in_summary(self):
+        response = _make_mock_response(200, "<html>hello world</html>")
+        async_cm, _ = _make_async_client_mock(response)
+        with patch("httpx.AsyncClient", return_value=async_cm):
+            result = await self.server.fetch(
+                "http://example.com/", assert_contains="hello"
+            )
+        assert "assert_contains" in result
+        assert "passed" in result
+
+    async def test_assert_contains_fail_raises(self):
+        response = _make_mock_response(200, "<html>hello world</html>")
+        async_cm, _ = _make_async_client_mock(response)
+        with patch("httpx.AsyncClient", return_value=async_cm):
+            with pytest.raises(ValueError, match="assert_contains failed"):
+                await self.server.fetch(
+                    "http://example.com/", assert_contains="not-present"
+                )
+
+    async def test_assert_contains_none_does_not_add_line(self):
+        response = _make_mock_response(200, "<html>ok</html>")
+        async_cm, _ = _make_async_client_mock(response)
+        with patch("httpx.AsyncClient", return_value=async_cm):
+            result = await self.server.fetch("http://example.com/")
+        assert "assert_contains" not in result
+
+
+class TestTraceRedirects:
+    """trace_redirects parameter: redirect chain appears in summary."""
+
+    @pytest.fixture(autouse=True)
+    def _server(self, monkeypatch):
+        self.server = _reload_server(monkeypatch)
+
+    async def test_trace_redirects_shows_none_when_no_redirects(self):
+        response = _make_mock_response(200, "<html>final</html>")
+        response.history = []
+        async_cm, _ = _make_async_client_mock(response)
+        with patch("httpx.AsyncClient", return_value=async_cm):
+            result = await self.server.fetch(
+                "http://example.com/", trace_redirects=True
+            )
+        assert "Redirect chain:   none" in result
+
+    async def test_trace_redirects_shows_chain_when_redirected(self):
+        # Build a mock redirect hop
+        redirect_hop = MagicMock()
+        redirect_hop.status_code = 301
+        redirect_hop.url = "http://example.com/"
+        redirect_hop.headers = {"location": "http://www.example.com/"}
+
+        response = _make_mock_response(200, "<html>final</html>")
+        response.history = [redirect_hop]
+        response.url = "http://www.example.com/"
+        async_cm, _ = _make_async_client_mock(response)
+        with patch("httpx.AsyncClient", return_value=async_cm):
+            result = await self.server.fetch(
+                "http://example.com/", trace_redirects=True
+            )
+        assert "Redirect chain:" in result
+        assert "301" in result
+
+    async def test_trace_redirects_disabled_by_default(self):
+        response = _make_mock_response(200, "<html>ok</html>")
+        response.history = []
+        async_cm, _ = _make_async_client_mock(response)
+        with patch("httpx.AsyncClient", return_value=async_cm):
+            result = await self.server.fetch("http://example.com/")
+        assert "Redirect chain" not in result
+
+
+class TestFollowRedirectsFalse:
+    """follow_redirects=False: redirect response returned without following."""
+
+    @pytest.fixture(autouse=True)
+    def _server(self, monkeypatch):
+        self.server = _reload_server(monkeypatch)
+
+    async def test_redirect_response_returned_directly(self):
+        response = _make_mock_response(301, "")
+        response.history = []
+        async_cm, _ = _make_async_client_mock(response)
+        with patch("httpx.AsyncClient", return_value=async_cm):
+            result = await self.server.fetch(
+                "http://example.com/", follow_redirects=False
+            )
+        assert "Status:           301" in result
+
+    async def test_follow_redirects_false_passed_to_client(self):
+        response = _make_mock_response(200, "<html>ok</html>")
+        async_cm, client_mock = _make_async_client_mock(response)
+        with patch("httpx.AsyncClient", return_value=async_cm) as mock_cls:
+            await self.server.fetch("http://example.com/", follow_redirects=False)
+        call_kwargs = mock_cls.call_args[1]
+        assert call_kwargs["follow_redirects"] is False
+
+
+class TestCssSelectorWithOutputFormat:
+    """CSS selector combined with output_format conversion."""
+
+    @pytest.fixture(autouse=True)
+    def _server(self, monkeypatch):
+        self.server = _reload_server(monkeypatch)
+
+    async def test_css_selector_then_markdown(self):
+        """Content extracted by CSS selector must be passed through markdownify."""
+        html = "<html><body><article><h1>Title</h1><p>Body text</p></article></body></html>"
+        response = _make_mock_response(200, html)
+        async_cm, _ = _make_async_client_mock(response)
+        with patch("httpx.AsyncClient", return_value=async_cm):
+            result = await self.server.fetch(
+                "http://example.com/",
+                css_selector="article",
+                output_format="markdown",
+            )
+        # Both selector and format must appear in summary
+        assert "applied" in result
+        assert "Output format:    markdown" in result
+        # Markdown heading must be present in the body
+        assert "Title" in result

@@ -9,10 +9,13 @@ back to the legacy WEBFETCH_HEADERS / WEBFETCH_OUTPUT environment variables.
 """
 
 import asyncio
+import datetime
+import ipaddress
 import json
 import logging
 import os
 import re
+import ssl
 import time
 from pathlib import Path
 from urllib.parse import urlparse
@@ -26,11 +29,21 @@ load_dotenv()
 mcp = FastMCP("webfetch")
 _log = logging.getLogger(__name__)
 
+# Dedicated audit logger.  Enabled by setting WEBFETCH_AUDIT_LOG=1 at startup.
+# Each record is emitted as a single JSON line on the "webfetch.audit" logger,
+# making it easy to pipe into a SIEM or structured log aggregator.
+_audit_log = logging.getLogger("webfetch.audit")
+_AUDIT_ENABLED: bool = os.getenv("WEBFETCH_AUDIT_LOG", "").strip() in ("1", "true", "yes")
+
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
 
 _VALID_OUTPUT_FORMATS = frozenset({"raw", "markdown", "trafilatura", "json"})
+
+# Default response-body cap (10 MB).  Prevents OOM when a remote server returns
+# an unexpectedly large payload.  Pass max_bytes=-1 to disable explicitly.
+_DEFAULT_MAX_BYTES = 10 * 1024 * 1024
 
 _VALID_SANITIZE_MODES = frozenset({"flag", "strip"})
 _VALID_BOT_BLOCK_MODES = frozenset({"report", "retry"})
@@ -71,7 +84,144 @@ _DEFAULT_GLOBAL: dict = {
     "sanitize_content": False,
     "bot_block_detection": False,
     "css_selector": None,
+    "allowed_domains": [],
+    "denied_domains": [],
+    "tls_verify": True,
+    "tls_ca_bundle": None,
+    "tls_min_version": None,
 }
+
+# ---------------------------------------------------------------------------
+# Audit logging
+# ---------------------------------------------------------------------------
+
+def _emit_audit_event(event: dict) -> None:
+    """Emit a structured JSON audit record if audit logging is enabled.
+
+    Each call appends a UTC timestamp and logs a single JSON line to the
+    ``webfetch.audit`` logger.  Downstream operators can attach a file
+    handler or forward to a SIEM by configuring Python logging externally.
+    """
+    if not _AUDIT_ENABLED:
+        return
+    event["ts"] = datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+    _audit_log.info(json.dumps(event, ensure_ascii=False))
+
+
+# ---------------------------------------------------------------------------
+# TLS helpers
+# ---------------------------------------------------------------------------
+
+_VALID_TLS_VERSIONS = {"1.2", "1.3"}
+
+
+def _build_ssl_context(
+    ca_bundle: str | None,
+    min_version: str | None,
+    verify: bool,
+) -> ssl.SSLContext | bool:
+    """Build an ssl.SSLContext for httpx from TLS config settings.
+
+    Returns a configured ``ssl.SSLContext`` when any TLS option is set,
+    or the plain ``verify`` boolean otherwise (httpx default behaviour).
+    """
+    if not verify:
+        _log.warning("TLS certificate verification is DISABLED — do not use in production")
+        return False
+
+    if ca_bundle is None and min_version is None:
+        return True  # use httpx default (system trust store, no version pin)
+
+    ctx = ssl.create_default_context(cafile=ca_bundle)
+
+    if min_version == "1.2":
+        ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+    elif min_version == "1.3":
+        ctx.minimum_version = ssl.TLSVersion.TLSv1_3
+
+    return ctx
+
+
+# ---------------------------------------------------------------------------
+# SSRF protection
+# ---------------------------------------------------------------------------
+
+# RFC-1918 private ranges, loopback, link-local (AWS metadata endpoint), and
+# IPv6 loopback / unique-local.  Requests resolving to any of these are blocked
+# unless the operator explicitly configures an allowlist that includes the host.
+_PRIVATE_IP_RANGES = [
+    ipaddress.ip_network("127.0.0.0/8"),     # loopback IPv4
+    ipaddress.ip_network("10.0.0.0/8"),      # RFC-1918 class A
+    ipaddress.ip_network("172.16.0.0/12"),   # RFC-1918 class B
+    ipaddress.ip_network("192.168.0.0/16"),  # RFC-1918 class C
+    ipaddress.ip_network("169.254.0.0/16"),  # link-local / AWS metadata service
+    ipaddress.ip_network("0.0.0.0/8"),       # "this" network
+    ipaddress.ip_network("::1/128"),         # IPv6 loopback
+    ipaddress.ip_network("fc00::/7"),        # IPv6 unique-local (fc00:: and fd00::)
+    ipaddress.ip_network("fe80::/10"),       # IPv6 link-local
+]
+
+_ALLOWED_SCHEMES = frozenset({"http", "https"})
+
+# Hostnames that are always blocked regardless of how they resolve.
+_BLOCKED_HOSTNAMES = frozenset({"localhost", "ip6-localhost", "ip6-loopback"})
+
+
+def _validate_url(url: str, allowed_domains: list, denied_domains: list) -> None:
+    """Raise ValueError if *url* is disallowed.
+
+    Checks performed (in order):
+    1. URL scheme must be http or https.
+    2. Hostname must not be empty.
+    3. Hostname must not be in the blocked-hostname list.
+    4. If the hostname is a bare IP address it must not fall within any
+       private / reserved range.
+    5. If *denied_domains* is non-empty, the hostname must not match any entry.
+    6. If *allowed_domains* is non-empty, the hostname must match at least one
+       entry (suffix match, same logic as domain-header resolution).
+    """
+    parsed = urlparse(url)
+    scheme = (parsed.scheme or "").lower()
+    if scheme not in _ALLOWED_SCHEMES:
+        raise ValueError(
+            f"Disallowed URL scheme {scheme!r}. Only http and https are permitted."
+        )
+
+    host = (parsed.hostname or "").lower()
+    if not host:
+        raise ValueError("URL has no hostname.")
+
+    if host in _BLOCKED_HOSTNAMES:
+        raise ValueError(f"Disallowed host {host!r}: loopback/localhost is not permitted.")
+
+    try:
+        addr = ipaddress.ip_address(host)
+        for net in _PRIVATE_IP_RANGES:
+            if addr in net:
+                raise ValueError(
+                    f"Disallowed IP address {host!r}: falls within reserved range {net}."
+                )
+    except ValueError as exc:
+        if "Disallowed" in str(exc):
+            raise
+        # host is a domain name — not an IP literal; continue with domain checks
+
+    if denied_domains:
+        for entry in denied_domains:
+            entry_lower = entry.lower()
+            if host == entry_lower or host.endswith("." + entry_lower):
+                raise ValueError(
+                    f"Host {host!r} is in the denied_domains list ({entry!r})."
+                )
+
+    if allowed_domains:
+        for entry in allowed_domains:
+            entry_lower = entry.lower()
+            if host == entry_lower or host.endswith("." + entry_lower):
+                return  # host is explicitly allowed
+        raise ValueError(
+            f"Host {host!r} is not in the allowed_domains list."
+        )
 
 # ---------------------------------------------------------------------------
 # Config loading
@@ -220,6 +370,36 @@ def _merge_domain_section(target: dict, source: dict, *, context: str) -> None:
         val = source["css_selector"]
         target["css_selector"] = str(val) if val is not None else None
 
+    if "tls_verify" in source:
+        val = source["tls_verify"]
+        if not isinstance(val, bool):
+            raise RuntimeError(
+                f"'{context}.tls_verify' must be a boolean, got {type(val).__name__!r}"
+            )
+        target["tls_verify"] = val
+
+    if "tls_ca_bundle" in source:
+        val = source["tls_ca_bundle"]
+        target["tls_ca_bundle"] = str(val) if val is not None else None
+
+    if "tls_min_version" in source:
+        val = source["tls_min_version"]
+        if val not in _VALID_TLS_VERSIONS:
+            raise RuntimeError(
+                f"'{context}.tls_min_version' is {val!r}; "
+                f"must be one of {sorted(_VALID_TLS_VERSIONS)}"
+            )
+        target["tls_min_version"] = val
+
+    for list_key in ("allowed_domains", "denied_domains"):
+        if list_key in source:
+            val = source[list_key]
+            if not isinstance(val, list) or not all(isinstance(x, str) for x in val):
+                raise RuntimeError(
+                    f"'{context}.{list_key}' must be a list of strings, got {val!r}"
+                )
+            target[list_key] = [str(v).lower() for v in val]
+
 
 def _load_env_config() -> dict:
     """Build the canonical config dict from legacy environment variables."""
@@ -272,6 +452,16 @@ def _load_env_config() -> dict:
             else:
                 config["domains"].setdefault(key, {})["output_format"] = fmt
 
+    # --- WEBFETCH_ALLOWED_DOMAINS / WEBFETCH_DENIED_DOMAINS ---
+    for env_key, cfg_key in (
+        ("WEBFETCH_ALLOWED_DOMAINS", "allowed_domains"),
+        ("WEBFETCH_DENIED_DOMAINS", "denied_domains"),
+    ):
+        raw_domains_val = os.getenv(env_key, "")
+        if raw_domains_val:
+            entries = [d.strip().lower() for d in raw_domains_val.split(",") if d.strip()]
+            config["global"][cfg_key] = entries
+
     # --- WEBFETCH_SELECTORS ---
     raw_selectors = os.getenv("WEBFETCH_SELECTORS", "")
     if raw_selectors:
@@ -292,7 +482,11 @@ def _load_env_config() -> dict:
 
 
 # Load once at startup
-_CONFIG: dict = _load_config()
+try:
+    _CONFIG: dict = _load_config()
+except RuntimeError as _startup_exc:
+    _log.critical("webfetch: fatal config error — %s", _startup_exc)
+    raise SystemExit(1) from _startup_exc
 _log.info(
     "webfetch startup: %d domain(s) configured (source: %s)",
     len(_CONFIG["domains"]),
@@ -426,6 +620,31 @@ def _resolve_bot_block_detection(hostname: str) -> str | bool:
     return val
 
 
+def _resolve_tls_config(hostname: str) -> tuple[bool, str | None, str | None]:
+    """Return (tls_verify, ca_bundle, min_version) for *hostname*."""
+    verify: bool = _CONFIG["global"].get("tls_verify", True)
+    ca_bundle: str | None = _CONFIG["global"].get("tls_ca_bundle")
+    min_version: str | None = _CONFIG["global"].get("tls_min_version")
+
+    for key in _matching_domain_keys(hostname, _CONFIG["domains"]):
+        domain = _CONFIG["domains"][key]
+        if "tls_verify" in domain:
+            verify = domain["tls_verify"]
+        if "tls_ca_bundle" in domain:
+            ca_bundle = domain["tls_ca_bundle"]
+        if "tls_min_version" in domain:
+            min_version = domain["tls_min_version"]
+
+    return verify, ca_bundle, min_version
+
+
+def _resolve_allowed_denied_domains() -> tuple[list[str], list[str]]:
+    """Return (allowed_domains, denied_domains) from global config."""
+    allowed: list[str] = _CONFIG["global"].get("allowed_domains", [])
+    denied: list[str] = _CONFIG["global"].get("denied_domains", [])
+    return allowed, denied
+
+
 def _resolve_css_selector(hostname: str, per_call_selector: str | None) -> str | None:
     """Return the effective CSS selector for *hostname*, or None.
 
@@ -487,16 +706,21 @@ def _apply_output_format(content: str, fmt: str) -> str:
 
 def _extract_text(html: str) -> str:
     """Strip HTML tags and collapse whitespace."""
-    text = re.sub(r"<[^>]+>", " ", html)
+    text = re.sub(r"<!--.*?-->", " ", html, flags=re.DOTALL)
+    text = re.sub(r"<!\[CDATA\[.*?\]\]>", " ", text, flags=re.DOTALL)
+    text = re.sub(r"<[^>]+>", " ", text)
     text = re.sub(r"\s+", " ", text)
     return text.strip()
 
 
-def _apply_css_selector(html: str, selector: str) -> str:
+def _apply_css_selector(html: str, selector: str) -> tuple[str, bool]:
     """Extract elements matching *selector* from *html* and return them as HTML.
 
     All matching elements are concatenated.  Falls back to the original HTML
     if no elements match or if BeautifulSoup raises an exception.
+
+    Returns a ``(html, matched)`` tuple where *matched* is True only when at
+    least one element was found and extracted.
     """
     try:
         from bs4 import BeautifulSoup  # lazy import
@@ -504,11 +728,11 @@ def _apply_css_selector(html: str, selector: str) -> str:
         elements = soup.select(selector)
         if not elements:
             _log.warning("css_selector %r matched nothing; using full HTML", selector)
-            return html
-        return "\n".join(str(el) for el in elements)
+            return html, False
+        return "\n".join(str(el) for el in elements), True
     except Exception as exc:
         _log.warning("css_selector apply failed (%s); using full HTML", exc)
-        return html
+        return html, False
 
 
 def _extract_trafilatura_metadata(raw_html: str) -> str | None:
@@ -577,10 +801,27 @@ def _detect_bot_block(status_code: int, resp_headers: dict, body: str) -> str | 
 
 _INVALID_HEADER_RE = re.compile(r"[\r\n\x00]")
 
+# Headers that must not be overridden by callers to prevent HTTP request
+# smuggling and host-header injection attacks.
+_FORBIDDEN_HEADERS = frozenset({
+    "host",
+    "content-length",
+    "transfer-encoding",
+    "connection",
+    "upgrade",
+    "te",
+    "trailers",
+})
+
 
 def _validate_headers(headers: dict[str, str]) -> None:
-    """Raise ValueError if any header name or value contains \\r, \\n, or NUL."""
+    """Raise ValueError if any header is forbidden or contains control characters."""
     for name, value in headers.items():
+        if name.lower() in _FORBIDDEN_HEADERS:
+            raise ValueError(
+                f"Header {name!r} cannot be set by callers "
+                f"(potential HTTP request smuggling vector)."
+            )
         if _INVALID_HEADER_RE.search(name):
             raise ValueError(f"Invalid header name contains control character: {name!r}")
         if _INVALID_HEADER_RE.search(str(value)):
@@ -642,6 +883,9 @@ async def fetch(
     parsed = urlparse(url)
     hostname = parsed.hostname or ""
 
+    allowed_domains, denied_domains = _resolve_allowed_denied_domains()
+    _validate_url(url, allowed_domains, denied_domains)
+
     if output_format is not None and output_format not in _VALID_OUTPUT_FORMATS:
         raise ValueError(
             f"Invalid output_format {output_format!r}. "
@@ -668,9 +912,13 @@ async def fetch(
         attempts,
     )
 
+    tls_verify, tls_ca_bundle, tls_min_version = _resolve_tls_config(hostname)
+    ssl_context = _build_ssl_context(tls_ca_bundle, tls_min_version, tls_verify)
+
     client_kwargs: dict = {
         "follow_redirects": follow_redirects,
         "timeout": timeout,
+        "verify": ssl_context,
     }
     if proxy:
         client_kwargs["proxy"] = proxy
@@ -786,14 +1034,18 @@ async def fetch(
         effective_fmt = "text"
     else:
         effective_fmt = _resolve_output_format(hostname, output_format)
-        if effective_fmt == "raw" and "application/json" in content_type:
+        # Auto-detect JSON only when the caller did not explicitly request a format
+        # and neither global nor domain config specified one (resolved to "raw" by
+        # default). Explicit output_format="raw" preserves the raw response.
+        if output_format is None and effective_fmt == "raw" and "application/json" in content_type:
             effective_fmt = "json"
 
     # --- CSS selector extraction ---
     effective_selector = _resolve_css_selector(hostname, css_selector)
     css_selector_applied = False
+    css_selector_matched = False
     if effective_selector and "html" in content_type.lower():
-        content = _apply_css_selector(content, effective_selector)
+        content, css_selector_matched = _apply_css_selector(content, effective_selector)
         css_selector_applied = True
 
     content = _apply_output_format(content, effective_fmt)
@@ -806,8 +1058,17 @@ async def fetch(
         if metadata_block:
             content = metadata_block + "\n\n---\n\n" + content
 
-    if max_bytes > 0:
-        content = content[:max_bytes]
+    # Apply size cap: explicit max_bytes > 0 overrides default; -1 disables entirely.
+    effective_max_bytes: int
+    if max_bytes == -1:
+        effective_max_bytes = 0  # disabled
+    elif max_bytes > 0:
+        effective_max_bytes = max_bytes
+    else:
+        effective_max_bytes = _DEFAULT_MAX_BYTES
+
+    if effective_max_bytes > 0:
+        content = content[:effective_max_bytes]
 
     # --- Response assertions ---
     assertion_failures: list[str] = []
@@ -835,7 +1096,14 @@ async def fetch(
             content = warning + "\n\n" + content
 
     injected = ", ".join(applied_header_names) if applied_header_names else "none"
-    truncated_str = f"yes (max_bytes={max_bytes})" if max_bytes > 0 else "no"
+    if effective_max_bytes > 0 and len(content) == effective_max_bytes:
+        truncated_str = f"yes (cap={effective_max_bytes})"
+    elif max_bytes == -1:
+        truncated_str = "no (cap disabled)"
+    elif effective_max_bytes > 0:
+        truncated_str = f"no (cap={effective_max_bytes})"
+    else:
+        truncated_str = "no"
     proxy_str = proxy or "none"
     retry_str = f"{actual_attempts}/{attempts}" if attempts > 1 else "disabled"
 
@@ -854,7 +1122,12 @@ async def fetch(
             f"({len(injection_warnings)} pattern(s) found)"
         )
     if effective_selector:
-        applied_str = "applied" if css_selector_applied else "skipped (non-HTML content)"
+        if not css_selector_applied:
+            applied_str = "skipped (non-HTML content)"
+        elif css_selector_matched:
+            applied_str = "applied"
+        else:
+            applied_str = "no match (full HTML used)"
         extra_lines += f"\nCSS selector:     {effective_selector!r} ({applied_str})"
     if trace_redirects:
         if redirect_chain_str:
@@ -883,6 +1156,20 @@ async def fetch(
         f"{extra_lines}\n"
         f"---"
     )
+    _emit_audit_event({
+        "event": "fetch",
+        "url": url,
+        "hostname": hostname,
+        "method": method.upper(),
+        "status": response.status_code,
+        "elapsed_ms": elapsed_ms,
+        "response_bytes": response_size,
+        "output_format": effective_fmt,
+        "headers_injected": applied_header_names,
+        "proxy": proxy,
+        "retry_attempt": actual_attempts,
+        "bot_blocked": bot_block_reason,
+    })
     return f"{summary}\n\n{content}"
 
 
