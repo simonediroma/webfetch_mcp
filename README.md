@@ -1,29 +1,48 @@
-# claude-webfetch-mcp
+# webfetch-mcp
 
-A local Python MCP server that replaces Claude's built-in `WebFetch` tool, adding support for **domain-scoped custom HTTP headers** — useful for authenticating against services that require custom HTTP headers per domain (e.g. bot protection, API gateways, CDN auth).
+A local Python MCP server that replaces Claude's built-in `WebFetch` tool with a fully configurable HTTP client — supporting **domain-scoped headers, retries, proxies, timeouts, output formats, bot-block detection, and prompt-injection sanitization**, all without touching a single line of Claude's config beyond registering the server.
 
 ## Why
 
-Claude's built-in WebFetch tool sends requests without custom headers, which means it gets blocked by bot-protection systems or services requiring custom headers. This server acts as a drop-in replacement: it exposes the same `fetch` tool to Claude, but injects the right authentication headers automatically based on the target domain.
+Claude's built-in `WebFetch` sends requests without custom headers, which means it gets blocked by bot-protection systems (Akamai, Cloudflare, paywalls, etc.) and can't authenticate against APIs that require domain-specific tokens.
+
+This server is a drop-in replacement: it exposes the same `fetch` tool to Claude, but enriches every outbound request with the right headers, format, and retry strategy based on the target domain — automatically, without you having to ask Claude to add headers every time.
+
+---
 
 ## Features
 
-- **Domain-scoped headers** — different headers per domain, plus a global `*` fallback
-- **Per-call headers** — Claude (or you) can pass extra headers at call time
-- **HTML text extraction** — optional stripping of HTML tags for cleaner LLM context
-- **Response size limit** — optional truncation to avoid blowing up Claude's context window
-- **Env-based config** — secrets stay in `.env`, never in code
+| Feature | Description |
+|---------|-------------|
+| **Domain-scoped headers** | Different auth headers per domain; global `*` fallback |
+| **Per-call headers** | Claude (or you) can inject extra headers for a single request |
+| **YAML config** | Single readable file controls headers, timeouts, retries, proxies, and output formats |
+| **Configurable timeout** | Per-domain request timeout (default 30 s) |
+| **Retry with backoff** | Auto-retry on HTTP 5xx or network errors, with exponential backoff |
+| **Per-domain proxy** | Route traffic through a different proxy per domain |
+| **Output formats** | `raw`, `markdown`, `trafilatura` (main content), `json` (pretty-print) |
+| **JSON auto-detection** | Responses with `application/json` Content-Type are pretty-printed automatically |
+| **Metadata extraction** | Extracts title, author, date, source via trafilatura (opt-in per domain) |
+| **Bot-block detection** | Detects Cloudflare / CAPTCHA blocks; optionally retries with a Chrome User-Agent |
+| **Prompt-injection sanitization** | Scans fetched content for injection patterns; `flag` or `strip` mode |
+| **Header injection protection** | Validates headers for control characters (`\r`, `\n`, NUL) |
+| **Response truncation** | `max_bytes` cap to avoid filling Claude's context window |
+| **Detailed response summary** | Every response includes a structured summary (status, injected headers, timing, format, etc.) |
+
+---
 
 ## Requirements
 
 - Python 3.10+
-- [Claude Code](https://claude.ai/code)
+- [Claude Code](https://claude.ai/code) (CLI, desktop app, or IDE extension)
+
+---
 
 ## Installation
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/claude-webfetch-mcp.git
-cd claude-webfetch-mcp
+git clone https://github.com/simonediroma/webfetch_mcp.git
+cd webfetch_mcp
 
 python -m venv .venv
 
@@ -34,29 +53,99 @@ python -m venv .venv
 .venv/bin/pip install -r requirements.txt
 ```
 
+---
+
 ## Configuration
 
-Copy the example env file and fill in your tokens:
+There are two ways to configure the server. **YAML is recommended** — it supports all options. The legacy environment variable approach still works for simple cases.
+
+### Option A — YAML config file (recommended)
+
+Copy the example and edit it:
+
+```bash
+cp webfetch.yaml.example webfetch.yaml
+```
+
+Point the server at it:
+
+```bash
+# In your shell profile, or in the MCP server env block (see Registration below)
+export WEBFETCH_CONFIG=/absolute/path/to/webfetch.yaml
+```
+
+#### Full YAML reference
+
+```yaml
+# Global defaults — applied to every request unless overridden
+global:
+  headers:
+    User-Agent: "MyBot/1.0"
+  output_format: raw       # raw | markdown | trafilatura | json
+  timeout: 30              # seconds
+  retry:
+    attempts: 1            # 1 = no retry
+    backoff: 2.0           # exponential multiplier (1s → 2s → 4s …)
+  proxy: null              # e.g. "http://proxy.corp:8080"
+  extract_metadata: false  # true = prepend title/author/date to content
+  sanitize_content: false  # false | "flag" | "strip"
+  bot_block_detection: false  # false | "report" | "retry"
+
+# Per-domain overrides — only the fields you list are overridden
+domains:
+  example.com:
+    headers:
+      X-Akamai-Token: "your-token-here"
+    output_format: trafilatura
+    timeout: 60
+    retry:
+      attempts: 3
+      backoff: 2.0
+
+  news-site.com:
+    output_format: markdown
+    bot_block_detection: retry   # auto-retry with Chrome UA if blocked
+
+  internal.corp:
+    proxy: "http://proxy.corp:8080"
+    headers:
+      Authorization: "Bearer my-internal-token"
+
+  api.example.com:
+    output_format: json
+    timeout: 10
+    retry:
+      attempts: 5
+      backoff: 1.5
+```
+
+Domain matching uses **suffix rules**: `example.com` matches both `example.com` and `www.example.com`. When multiple domains match, the most specific (longest) key wins. Global settings are always applied first, then overridden by increasingly specific domain rules.
+
+---
+
+### Option B — Environment variables (legacy)
+
+Copy `.env.example` and fill in your values:
 
 ```bash
 cp .env.example .env
 ```
 
-Edit `.env` — the value must be **a single-line JSON object**:
+**`WEBFETCH_HEADERS`** — domain-scoped request headers (single-line JSON):
 
 ```env
 WEBFETCH_HEADERS={"*": {"User-Agent": "MyBot/1.0"}, "example.com": {"X-Auth-Token": "your-token"}}
 ```
 
-### Header scoping rules
+**`WEBFETCH_OUTPUT`** — domain-scoped output format (single-line JSON):
 
-| Key | When applied |
-|-----|-------------|
-| `"*"` | Every request |
-| `"example.com"` | Requests whose hostname ends with `example.com` (matches `www.example.com` too) |
+```env
+WEBFETCH_OUTPUT={"*": "raw", "example.com": "trafilatura", "news.com": "markdown"}
+```
 
-Multiple domain keys can coexist. Merge order (later wins on conflict):
-**global `*`** → **domain-specific** → **per-call `extra_headers`**
+> When `WEBFETCH_CONFIG` is set, the env vars above are ignored entirely.
+
+---
 
 ## Registering with Claude Code
 
@@ -67,7 +156,10 @@ Add to `~/.claude/settings.json`:
   "mcpServers": {
     "webfetch": {
       "command": "/absolute/path/to/.venv/bin/python",
-      "args": ["/absolute/path/to/server.py"]
+      "args": ["/absolute/path/to/server.py"],
+      "env": {
+        "WEBFETCH_CONFIG": "/absolute/path/to/webfetch.yaml"
+      }
     }
   }
 }
@@ -75,32 +167,175 @@ Add to `~/.claude/settings.json`:
 
 > **Windows:** use `.venv\Scripts\python.exe`
 
-Restart Claude Code. The tool will be available as `mcp__webfetch__fetch`.
+Restart Claude Code after saving. The tool appears as **`mcp__webfetch__fetch`** and Claude will use it automatically for web requests.
 
-## Tool reference
+---
+
+## Tool API
+
+All parameters are optional except `url`.
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
 | `url` | `str` | — | URL to fetch |
-| `method` | `str` | `"GET"` | HTTP verb |
-| `body` | `str \| None` | `None` | Request body (POST/PUT) |
-| `extra_headers` | `dict \| None` | `None` | Additional per-call headers |
-| `extract_text` | `bool` | `False` | Strip HTML, return clean text |
-| `max_bytes` | `int` | `0` | Truncate response (0 = unlimited) |
+| `method` | `str` | `"GET"` | HTTP verb (GET, POST, PUT, DELETE, …) |
+| `body` | `str \| None` | `None` | Request body for POST/PUT |
+| `extra_headers` | `dict \| None` | `None` | Per-call headers merged on top of domain headers |
+| `extract_text` | `bool` | `False` | Strip HTML tags, return plain text (legacy; overrides `output_format`) |
+| `max_bytes` | `int` | `0` | Truncate response to N characters (0 = unlimited) |
+| `follow_redirects` | `bool` | `True` | Follow HTTP redirects |
+| `output_format` | `str \| None` | `None` | Per-call format override: `"raw"`, `"markdown"`, `"trafilatura"`, `"json"` |
 
-### Example response
+### Response format
+
+Every response starts with a structured summary block:
 
 ```
-Status: 200
-Injected headers: User-Agent, X-Auth-Token
+--- Request Summary ---
+URL:              https://example.com/article
+Method:           GET
+Injected headers: User-Agent, X-Akamai-Token
+Status:           200 OK
+Response size:    42381 bytes
+Output format:    trafilatura
+Text extracted:   no
+Truncated:        no
+Timeout:          60.0s
+Proxy:            none
+Retry:            disabled
+Bot block:        none
+Metadata:         extracted
+Sanitization:     flag (0 pattern(s) found)
+---
 
-<!DOCTYPE html>...
+**Title:** Example Article
+**Author:** Jane Doe
+**Date:** 2024-01-15
+**Source:** Example News
+
+---
+
+[Main article content as Markdown …]
 ```
+
+---
+
+## Use cases
+
+### Bypass Akamai bot protection on a specific domain
+
+```yaml
+# webfetch.yaml
+domains:
+  mysite.com:
+    headers:
+      X-Akamai-Token: "your-token"
+      Cookie: "session=abc123"
+    output_format: trafilatura
+```
+
+Claude now fetches `mysite.com` pages with your session and extracts clean article text automatically.
+
+---
+
+### Extract clean article content from news sites
+
+```yaml
+domains:
+  theguardian.com:
+    output_format: trafilatura
+    extract_metadata: true
+
+  reuters.com:
+    output_format: markdown
+```
+
+---
+
+### Consume JSON APIs reliably
+
+```yaml
+domains:
+  api.example.com:
+    output_format: json
+    timeout: 10
+    retry:
+      attempts: 5
+      backoff: 1.5
+    headers:
+      Authorization: "Bearer my-api-key"
+```
+
+Responses are pretty-printed JSON. If the endpoint returns `application/json` but you forget to set `output_format`, the server detects it automatically.
+
+---
+
+### Route corporate intranet traffic through a proxy
+
+```yaml
+domains:
+  internal.corp:
+    proxy: "http://proxy.corp:8080"
+    headers:
+      Authorization: "Bearer my-internal-token"
+    timeout: 60
+```
+
+---
+
+### Detect and recover from bot blocks automatically
+
+```yaml
+domains:
+  news-site.com:
+    bot_block_detection: retry   # retry once with a Chrome User-Agent
+```
+
+In `report` mode, the summary block flags the block without retrying. In `retry` mode, the server automatically issues a second request with a realistic Chrome User-Agent.
+
+---
+
+### Protect Claude from prompt-injection in untrusted pages
+
+```yaml
+global:
+  sanitize_content: flag    # warn Claude when suspicious patterns are found
+
+domains:
+  untrusted-forum.com:
+    sanitize_content: strip  # silently remove injection attempts
+```
+
+---
 
 ## Security
 
-- `.env` is git-ignored — tokens never leave your machine
-- Headers are only injected for matching domains — unrelated requests get only global headers
+- **Secrets stay local** — `.env` and `webfetch.yaml` are git-ignored; tokens never leave your machine.
+- **Domain isolation** — headers are injected only for matching domains; unrelated requests receive only global headers.
+- **Header injection protection** — the server validates all header names and values for control characters before sending.
+- **Prompt-injection sanitization** — optionally scan and flag/strip patterns like "ignore all previous instructions" from fetched content.
+
+---
+
+## Running locally (development)
+
+```bash
+# Mac / Linux
+.venv/bin/python server.py
+
+# Windows
+.venv\Scripts\python.exe server.py
+```
+
+The server communicates over **stdio** (standard MCP transport). No HTTP port is used.
+
+Run the test suite:
+
+```bash
+pytest tests/ -v
+```
+
+---
 
 ## License
 
