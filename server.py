@@ -292,7 +292,11 @@ def _load_env_config() -> dict:
 
 
 # Load once at startup
-_CONFIG: dict = _load_config()
+try:
+    _CONFIG: dict = _load_config()
+except RuntimeError as _startup_exc:
+    _log.critical("webfetch: fatal config error — %s", _startup_exc)
+    raise SystemExit(1) from _startup_exc
 _log.info(
     "webfetch startup: %d domain(s) configured (source: %s)",
     len(_CONFIG["domains"]),
@@ -487,16 +491,21 @@ def _apply_output_format(content: str, fmt: str) -> str:
 
 def _extract_text(html: str) -> str:
     """Strip HTML tags and collapse whitespace."""
-    text = re.sub(r"<[^>]+>", " ", html)
+    text = re.sub(r"<!--.*?-->", " ", html, flags=re.DOTALL)
+    text = re.sub(r"<!\[CDATA\[.*?\]\]>", " ", text, flags=re.DOTALL)
+    text = re.sub(r"<[^>]+>", " ", text)
     text = re.sub(r"\s+", " ", text)
     return text.strip()
 
 
-def _apply_css_selector(html: str, selector: str) -> str:
+def _apply_css_selector(html: str, selector: str) -> tuple[str, bool]:
     """Extract elements matching *selector* from *html* and return them as HTML.
 
     All matching elements are concatenated.  Falls back to the original HTML
     if no elements match or if BeautifulSoup raises an exception.
+
+    Returns a ``(html, matched)`` tuple where *matched* is True only when at
+    least one element was found and extracted.
     """
     try:
         from bs4 import BeautifulSoup  # lazy import
@@ -504,11 +513,11 @@ def _apply_css_selector(html: str, selector: str) -> str:
         elements = soup.select(selector)
         if not elements:
             _log.warning("css_selector %r matched nothing; using full HTML", selector)
-            return html
-        return "\n".join(str(el) for el in elements)
+            return html, False
+        return "\n".join(str(el) for el in elements), True
     except Exception as exc:
         _log.warning("css_selector apply failed (%s); using full HTML", exc)
-        return html
+        return html, False
 
 
 def _extract_trafilatura_metadata(raw_html: str) -> str | None:
@@ -786,14 +795,18 @@ async def fetch(
         effective_fmt = "text"
     else:
         effective_fmt = _resolve_output_format(hostname, output_format)
-        if effective_fmt == "raw" and "application/json" in content_type:
+        # Auto-detect JSON only when the caller did not explicitly request a format
+        # and neither global nor domain config specified one (resolved to "raw" by
+        # default). Explicit output_format="raw" preserves the raw response.
+        if output_format is None and effective_fmt == "raw" and "application/json" in content_type:
             effective_fmt = "json"
 
     # --- CSS selector extraction ---
     effective_selector = _resolve_css_selector(hostname, css_selector)
     css_selector_applied = False
+    css_selector_matched = False
     if effective_selector and "html" in content_type.lower():
-        content = _apply_css_selector(content, effective_selector)
+        content, css_selector_matched = _apply_css_selector(content, effective_selector)
         css_selector_applied = True
 
     content = _apply_output_format(content, effective_fmt)
@@ -854,7 +867,12 @@ async def fetch(
             f"({len(injection_warnings)} pattern(s) found)"
         )
     if effective_selector:
-        applied_str = "applied" if css_selector_applied else "skipped (non-HTML content)"
+        if not css_selector_applied:
+            applied_str = "skipped (non-HTML content)"
+        elif css_selector_matched:
+            applied_str = "applied"
+        else:
+            applied_str = "no match (full HTML used)"
         extra_lines += f"\nCSS selector:     {effective_selector!r} ({applied_str})"
     if trace_redirects:
         if redirect_chain_str:

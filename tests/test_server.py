@@ -80,14 +80,14 @@ class TestLoadConfigEnv:
         monkeypatch.setenv("WEBFETCH_HEADERS", "not-valid-json{{{")
         monkeypatch.delenv("WEBFETCH_CONFIG", raising=False)
         sys.modules.pop("server", None)
-        with pytest.raises((RuntimeError, Exception)):
+        with pytest.raises((RuntimeError, SystemExit, Exception)):
             import server  # noqa: F401
 
     def test_non_dict_headers_raises(self, monkeypatch):
         monkeypatch.setenv("WEBFETCH_HEADERS", '["a", "b"]')
         monkeypatch.delenv("WEBFETCH_CONFIG", raising=False)
         sys.modules.pop("server", None)
-        with pytest.raises((RuntimeError, Exception)):
+        with pytest.raises((RuntimeError, SystemExit, Exception)):
             import server  # noqa: F401
 
     def test_domain_headers_stored_in_domains(self, monkeypatch):
@@ -112,7 +112,7 @@ class TestLoadConfigEnv:
         monkeypatch.setenv("WEBFETCH_OUTPUT", '{"*": "nonexistent"}')
         monkeypatch.delenv("WEBFETCH_CONFIG", raising=False)
         sys.modules.pop("server", None)
-        with pytest.raises((RuntimeError, Exception)):
+        with pytest.raises((RuntimeError, SystemExit, Exception)):
             import server  # noqa: F401
 
 
@@ -152,7 +152,7 @@ class TestLoadConfigYaml:
     def test_yaml_missing_file_raises(self, monkeypatch, tmp_path):
         monkeypatch.setenv("WEBFETCH_CONFIG", str(tmp_path / "nonexistent.yaml"))
         sys.modules.pop("server", None)
-        with pytest.raises((RuntimeError, Exception)):
+        with pytest.raises((RuntimeError, SystemExit, Exception)):
             import server  # noqa: F401
 
     def test_yaml_invalid_syntax_raises(self, monkeypatch, tmp_path):
@@ -160,7 +160,7 @@ class TestLoadConfigYaml:
         yaml_file.write_text("key: [unclosed")
         monkeypatch.setenv("WEBFETCH_CONFIG", str(yaml_file))
         sys.modules.pop("server", None)
-        with pytest.raises((RuntimeError, Exception)):
+        with pytest.raises((RuntimeError, SystemExit, Exception)):
             import server  # noqa: F401
 
     def test_yaml_minimal_empty(self, monkeypatch, tmp_path):
@@ -175,7 +175,7 @@ class TestLoadConfigYaml:
         yaml_file.write_text("global:\n  output_format: bad_value\n")
         monkeypatch.setenv("WEBFETCH_CONFIG", str(yaml_file))
         sys.modules.pop("server", None)
-        with pytest.raises((RuntimeError, Exception)):
+        with pytest.raises((RuntimeError, SystemExit, Exception)):
             import server  # noqa: F401
 
 
@@ -1054,3 +1054,89 @@ class TestFetchBotBlock:
         with patch("httpx.AsyncClient", return_value=async_cm):
             result = await self.server.fetch("http://example.com/")
         assert "Chrome retry:     no" in result
+
+
+# ---------------------------------------------------------------------------
+# Phase 1 bug-fix regression tests
+# ---------------------------------------------------------------------------
+
+class TestPhase1BugFixes:
+    """Regression tests for Phase 1 bug fixes."""
+
+    @pytest.fixture(autouse=True)
+    def _server(self, monkeypatch):
+        self.server = _reload_server(monkeypatch)
+
+    # --- 1a: JSON auto-detect must NOT fire when output_format="raw" is explicit ---
+
+    async def test_json_autodetect_fires_by_default(self):
+        """When no output_format is given and Content-Type is JSON, auto-detect to json."""
+        response = _make_mock_response(200, '{"key": "value"}', content_type="application/json")
+        async_cm, _ = _make_async_client_mock(response)
+        with patch("httpx.AsyncClient", return_value=async_cm):
+            result = await self.server.fetch("http://api.example.com/data")
+        assert "Output format:    json" in result
+
+    async def test_json_autodetect_skipped_when_output_format_raw_explicit(self):
+        """Explicit output_format='raw' must suppress JSON auto-detection."""
+        response = _make_mock_response(200, '{"key": "value"}', content_type="application/json")
+        async_cm, _ = _make_async_client_mock(response)
+        with patch("httpx.AsyncClient", return_value=async_cm):
+            result = await self.server.fetch(
+                "http://api.example.com/data", output_format="raw"
+            )
+        assert "Output format:    raw" in result
+        # Raw body must appear as-is, not pretty-printed
+        assert '{"key": "value"}' in result
+
+    # --- 1b: CSS selector no-match must be visible in summary ---
+
+    async def test_css_selector_no_match_shows_in_summary(self):
+        """When css_selector matches nothing, summary must say 'no match (full HTML used)'."""
+        response = _make_mock_response(200, "<html><body><p>hello</p></body></html>")
+        async_cm, _ = _make_async_client_mock(response)
+        with patch("httpx.AsyncClient", return_value=async_cm):
+            result = await self.server.fetch(
+                "http://example.com/", css_selector="div.nonexistent"
+            )
+        assert "no match (full HTML used)" in result
+
+    async def test_css_selector_match_shows_applied_in_summary(self):
+        """When css_selector matches, summary must say 'applied'."""
+        response = _make_mock_response(
+            200, "<html><body><article>content</article></body></html>"
+        )
+        async_cm, _ = _make_async_client_mock(response)
+        with patch("httpx.AsyncClient", return_value=async_cm):
+            result = await self.server.fetch(
+                "http://example.com/", css_selector="article"
+            )
+        assert "applied" in result
+        assert "no match" not in result
+
+    # --- 1c: _extract_text strips HTML comments and CDATA ---
+
+    def test_extract_text_strips_html_comments(self):
+        """HTML comments must be removed by _extract_text."""
+        html = "<p>Hello</p><!-- this is a comment -->World"
+        result = self.server._extract_text(html)
+        assert "comment" not in result
+        assert "Hello" in result
+        assert "World" in result
+
+    def test_extract_text_strips_cdata(self):
+        """CDATA sections must be removed by _extract_text."""
+        html = "<p>Before</p><![CDATA[secret data]]><p>After</p>"
+        result = self.server._extract_text(html)
+        assert "secret data" not in result
+        assert "Before" in result
+        assert "After" in result
+
+    def test_extract_text_strips_multiline_comment(self):
+        """Multi-line HTML comments must be fully stripped."""
+        html = "<p>A</p><!--\nline1\nline2\n--><p>B</p>"
+        result = self.server._extract_text(html)
+        assert "line1" not in result
+        assert "line2" not in result
+        assert "A" in result
+        assert "B" in result
