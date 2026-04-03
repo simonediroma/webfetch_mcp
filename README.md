@@ -1,12 +1,12 @@
 # webfetch-mcp
 
-A local Python MCP server that replaces your MCP client's built-in `WebFetch` tool with a fully configurable HTTP client — supporting **domain-scoped headers, retries, proxies, timeouts, output formats, bot-block detection, and prompt-injection sanitization**, all without touching a single line of your client's config beyond registering the server.
+A local Python MCP server that replaces your AI assistant's built-in `WebFetch` tool with a fully configurable HTTP client — supporting **domain-scoped headers, retries, proxies, timeouts, output formats, bot-block detection, and prompt-injection sanitization**, all without touching a single line of your assistant's config beyond registering the server.
 
 ## Why
 
-The built-in `WebFetch` tool available in most MCP clients sends requests without custom headers, which means it gets blocked by bot-protection systems (Akamai, Cloudflare, paywalls, etc.) and can't authenticate against APIs that require domain-specific tokens.
+The built-in `WebFetch` tool available in most AI assistants (Claude Code, Cursor, Continue, Zed, etc.) sends requests without custom headers, which means it gets blocked by bot-protection systems (Akamai, Cloudflare, paywalls, etc.) and can't authenticate against APIs that require domain-specific tokens.
 
-This server is a drop-in replacement: it exposes the same `fetch` tool to any MCP client, but enriches every outbound request with the right headers, format, and retry strategy based on the target domain — automatically, without you having to configure headers every time.
+This server is a drop-in replacement: it exposes the same `fetch` tool to any MCP-compatible AI assistant, but enriches every outbound request with the right headers, format, and retry strategy based on the target domain — automatically, without you having to configure headers every time.
 
 ---
 
@@ -29,7 +29,7 @@ This server is a drop-in replacement: it exposes the same `fetch` tool to any MC
 | **Redirect tracing** | Optionally record and display the full redirect chain in the summary |
 | **Response assertions** | `assert_status` / `assert_contains` raise an error on mismatch — useful for CI/CD smoke tests |
 | **Header injection protection** | Validates headers for control characters (`\r`, `\n`, NUL) |
-| **Response truncation** | `max_bytes` cap to avoid filling the client's context window |
+| **Response truncation** | `max_bytes` cap to avoid filling the assistant's context window |
 | **Detailed response summary** | Every response includes a structured summary (status, elapsed ms, injected headers, format, etc.) |
 
 ---
@@ -37,7 +37,7 @@ This server is a drop-in replacement: it exposes the same `fetch` tool to any MC
 ## Requirements
 
 - Python 3.10+
-- Any MCP-compatible client (Claude Code, Cursor, Continue, Zed, etc.)
+- Any MCP-compatible AI assistant (Claude Code, Cursor, Continue, Zed, etc.)
 
 ---
 
@@ -158,9 +158,9 @@ WEBFETCH_SELECTORS={"example.com": "article.main-content", "news.com": "div#arti
 
 ---
 
-## Registering with your MCP client
+## Registering with your AI assistant
 
-Most MCP-compatible clients use a `mcpServers` block in a JSON settings file. The format is the same across clients — only the file location differs.
+Most AI assistants use a `mcpServers` block in a JSON settings file. The format is the same across assistants — only the file location differs.
 
 ### Claude Code
 
@@ -198,9 +198,9 @@ Add to `~/.cursor/mcp.json` (or the project-level `.cursor/mcp.json`):
 }
 ```
 
-### Other clients (Continue, Zed, etc.)
+### Other assistants (Continue, Zed, etc.)
 
-Consult your client's MCP documentation for the exact config file location. The server block is the same — only the file path differs.
+Consult your assistant's MCP documentation for the exact config file location. The server block is the same — only the file path differs.
 
 > **Windows:** use `.venv\Scripts\python.exe` instead of `.venv/bin/python`
 
@@ -225,7 +225,7 @@ If the server doesn't appear, check:
 
 ## Forcing your client to use webfetch instead of the native tool
 
-Most MCP clients expose both their built-in WebFetch and any registered MCP tools. To ensure `mcp__webfetch__fetch` is always preferred:
+Most AI assistants expose both their built-in WebFetch and any registered MCP tools. To ensure `mcp__webfetch__fetch` is always preferred:
 
 ### Claude Code
 
@@ -245,9 +245,9 @@ Alternatively, add a `systemPrompt` entry to `~/.claude/settings.json`:
 }
 ```
 
-### Other MCP clients
+### Other AI assistants
 
-Consult your client's documentation for how to set a system prompt or custom instruction. The instruction to include is:
+Consult your assistant's documentation for how to set a system prompt or custom instruction. The instruction to include is:
 
 > Use `mcp__webfetch__fetch` for all web requests instead of any built-in fetch or browser tool.
 
