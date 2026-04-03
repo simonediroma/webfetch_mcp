@@ -24,7 +24,7 @@ import httpx
 from dotenv import load_dotenv
 from mcp.server.fastmcp import FastMCP
 
-load_dotenv()
+load_dotenv(Path(__file__).parent / ".env")
 
 mcp = FastMCP("webfetch")
 _log = logging.getLogger(__name__)
