@@ -559,8 +559,10 @@ async def fetch(
                           0 means no limit.
         follow_redirects: Follow HTTP redirects automatically. Default: True.
         output_format:    Override the output format for this request only.
-                          Accepted values: "raw" (default), "markdown",
-                          "trafilatura", "json".
+                          Accepted values: "raw", "markdown", "trafilatura", "json".
+                          If omitted, the server's configured default is used (do NOT
+                          pass "raw" unless you explicitly want raw output — omitting
+                          this parameter lets the server configuration take effect).
                           Ignored if extract_text=True (legacy compat).
     """
     parsed = urlparse(url)
