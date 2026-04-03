@@ -1,7 +1,7 @@
 """
 WebFetch MCP Server
 Replaces Claude's built-in WebFetch tool with support for domain-scoped
-custom HTTP headers (e.g. Akamai bot-defender authentication), retry logic,
+custom HTTP headers (e.g. provider-specific authentication tokens), retry logic,
 configurable timeouts, per-domain proxies, and flexible output formats.
 
 Configuration is loaded from a YAML file (WEBFETCH_CONFIG env var) or falls
@@ -604,7 +604,7 @@ async def fetch(
 ) -> str:
     """
     Fetch a URL and return its response, injecting domain-scoped authentication
-    headers (e.g. Akamai bot-defender tokens) automatically.
+    headers (e.g. provider-specific authentication tokens) automatically.
 
     Args:
         url:              The URL to request.

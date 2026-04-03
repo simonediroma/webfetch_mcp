@@ -52,7 +52,7 @@ domains:
   # example.com and any subdomain (e.g. www.example.com)
   example.com:
     headers:
-      X-Akamai-Token: "token-for-example"
+      X-Auth-Token: "token-for-example"
     output_format: trafilatura
     timeout: 60
     retry:

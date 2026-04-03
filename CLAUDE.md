@@ -2,7 +2,7 @@
 
 Local Python MCP server that replaces Claude's built-in WebFetch tool.
 Main purpose: inject **domain-scoped custom HTTP headers** into every outbound request,
-used to authenticate against Akamai bot-defender on specific domains.
+used to inject provider-specific authentication headers on specific domains.
 
 ---
 
@@ -42,7 +42,7 @@ cp .env.example .env   # then edit .env with real tokens
 `WEBFETCH_HEADERS` is a **single-line JSON object** with domain-scoped headers:
 
 ```env
-WEBFETCH_HEADERS={"*": {"User-Agent": "MyBot/1.0"}, "example.com": {"X-Akamai-Token": "TOKEN"}}
+WEBFETCH_HEADERS={"*": {"User-Agent": "MyBot/1.0"}, "example.com": {"X-Auth-Token": "TOKEN"}}
 ```
 
 | Key | Meaning |
@@ -132,7 +132,7 @@ fetch(
 Response format:
 ```
 Status: 200
-Injected headers: User-Agent, X-Akamai-Token
+Injected headers: User-Agent, X-Auth-Token
 
 <body>
 ```
