@@ -25,9 +25,12 @@ This server is a drop-in replacement: it exposes the same `fetch` tool to Claude
 | **Metadata extraction** | Extracts title, author, date, source via trafilatura (opt-in per domain) |
 | **Bot-block detection** | Detects Cloudflare / CAPTCHA blocks; optionally retries with a Chrome User-Agent |
 | **Prompt-injection sanitization** | Scans fetched content for injection patterns; `flag` or `strip` mode |
+| **CSS selector extraction** | Extract specific HTML elements before format conversion, configurable per domain or per call |
+| **Redirect tracing** | Optionally record and display the full redirect chain in the summary |
+| **Response assertions** | `assert_status` / `assert_contains` raise an error on mismatch — useful for CI/CD smoke tests |
 | **Header injection protection** | Validates headers for control characters (`\r`, `\n`, NUL) |
 | **Response truncation** | `max_bytes` cap to avoid filling Claude's context window |
-| **Detailed response summary** | Every response includes a structured summary (status, injected headers, timing, format, etc.) |
+| **Detailed response summary** | Every response includes a structured summary (status, elapsed ms, injected headers, format, etc.) |
 
 ---
 
@@ -90,6 +93,7 @@ global:
   extract_metadata: false  # true = prepend title/author/date to content
   sanitize_content: false  # false | "flag" | "strip"
   bot_block_detection: false  # false | "report" | "retry"
+  css_selector: null       # CSS selector to extract element(s) before format conversion
 
 # Per-domain overrides — only the fields you list are overridden
 domains:
@@ -105,6 +109,7 @@ domains:
   news-site.com:
     output_format: markdown
     bot_block_detection: retry   # auto-retry with Chrome UA if blocked
+    css_selector: "article.main-content"  # extract only the article body
 
   internal.corp:
     proxy: "http://proxy.corp:8080"
@@ -141,6 +146,12 @@ WEBFETCH_HEADERS={"*": {"User-Agent": "MyBot/1.0"}, "example.com": {"X-Auth-Toke
 
 ```env
 WEBFETCH_OUTPUT={"*": "raw", "example.com": "trafilatura", "news.com": "markdown"}
+```
+
+**`WEBFETCH_SELECTORS`** — domain-scoped CSS selector (single-line JSON):
+
+```env
+WEBFETCH_SELECTORS={"example.com": "article.main-content", "news.com": "div#article-body"}
 ```
 
 > When `WEBFETCH_CONFIG` is set, the env vars above are ignored entirely.
@@ -185,6 +196,10 @@ All parameters are optional except `url`.
 | `max_bytes` | `int` | `0` | Truncate response to N characters (0 = unlimited) |
 | `follow_redirects` | `bool` | `True` | Follow HTTP redirects |
 | `output_format` | `str \| None` | `None` | Per-call format override: `"raw"`, `"markdown"`, `"trafilatura"`, `"json"` |
+| `css_selector` | `str \| None` | `None` | CSS selector to extract HTML element(s) before format conversion (e.g. `"article"`, `"#main"`) |
+| `trace_redirects` | `bool` | `False` | Display the full redirect chain in the summary |
+| `assert_status` | `int \| None` | `None` | Raise an error if the response status code does not match this value |
+| `assert_contains` | `str \| None` | `None` | Raise an error if this string is not found in the response body (case-sensitive) |
 
 ### Response format
 
@@ -196,6 +211,7 @@ URL:              https://example.com/article
 Method:           GET
 Injected headers: User-Agent, X-Akamai-Token
 Status:           200 OK
+Elapsed:          843ms
 Response size:    42381 bytes
 Output format:    trafilatura
 Text extracted:   no
@@ -206,6 +222,7 @@ Retry:            disabled
 Bot block:        none
 Metadata:         extracted
 Sanitization:     flag (0 pattern(s) found)
+CSS selector:     "article.main-content" (applied)
 ---
 
 **Title:** Example Article
@@ -304,6 +321,55 @@ global:
 domains:
   untrusted-forum.com:
     sanitize_content: strip  # silently remove injection attempts
+```
+
+---
+
+### Extract a specific section of a page with CSS selector
+
+Configure it globally in the YAML for a domain:
+
+```yaml
+domains:
+  docs.example.com:
+    css_selector: "main article"   # only the article content, not nav/sidebar
+    output_format: markdown
+```
+
+Or pass it per-call when asking Claude to fetch a page:
+
+```
+fetch url="https://docs.example.com/guide" css_selector="section#quickstart"
+```
+
+If the selector matches nothing, the full HTML is used as fallback.
+
+---
+
+### Smoke test an endpoint from Claude (CI/CD style)
+
+Use `assert_status` and `assert_contains` to make the tool raise an error if the response doesn't match expectations — useful for health checks and regression tests:
+
+```
+fetch url="https://api.example.com/health" assert_status=200 assert_contains='"status":"ok"'
+```
+
+If the check fails, Claude receives a clear `ValueError` instead of silently returning a wrong response.
+
+---
+
+### Trace the redirect chain of a URL
+
+```
+fetch url="https://short.ly/abc123" trace_redirects=true
+```
+
+The summary will show each hop:
+
+```
+Redirect chain:
+  301  https://short.ly/abc123  →  https://example.com/landing
+  200  https://example.com/landing  (final)
 ```
 
 ---
