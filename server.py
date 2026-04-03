@@ -1,7 +1,7 @@
 """
 WebFetch MCP Server
 Replaces Claude's built-in WebFetch tool with support for domain-scoped
-custom HTTP headers (e.g. Akamai bot-defender authentication), retry logic,
+custom HTTP headers (e.g. provider-specific authentication tokens), retry logic,
 configurable timeouts, per-domain proxies, and flexible output formats.
 
 Configuration is loaded from a YAML file (WEBFETCH_CONFIG env var) or falls
@@ -69,6 +69,7 @@ _DEFAULT_GLOBAL: dict = {
     "extract_metadata": False,
     "sanitize_content": False,
     "bot_block_detection": False,
+    "css_selector": None,
 }
 
 # ---------------------------------------------------------------------------
@@ -214,6 +215,10 @@ def _merge_domain_section(target: dict, source: dict, *, context: str) -> None:
             )
         target["bot_block_detection"] = val
 
+    if "css_selector" in source:
+        val = source["css_selector"]
+        target["css_selector"] = str(val) if val is not None else None
+
 
 def _load_env_config() -> dict:
     """Build the canonical config dict from legacy environment variables."""
@@ -265,6 +270,22 @@ def _load_env_config() -> dict:
                 config["global"]["output_format"] = fmt
             else:
                 config["domains"].setdefault(key, {})["output_format"] = fmt
+
+    # --- WEBFETCH_SELECTORS ---
+    raw_selectors = os.getenv("WEBFETCH_SELECTORS", "")
+    if raw_selectors:
+        try:
+            selector_cfg = json.loads(raw_selectors)
+            if not isinstance(selector_cfg, dict):
+                raise ValueError("WEBFETCH_SELECTORS must be a JSON object")
+        except (json.JSONDecodeError, ValueError) as exc:
+            raise RuntimeError(f"Invalid WEBFETCH_SELECTORS: {exc}") from exc
+
+        for key, sel in selector_cfg.items():
+            if key == "*":
+                config["global"]["css_selector"] = str(sel)
+            else:
+                config["domains"].setdefault(key, {})["css_selector"] = str(sel)
 
     return config
 
@@ -404,6 +425,24 @@ def _resolve_bot_block_detection(hostname: str) -> str | bool:
     return val
 
 
+def _resolve_css_selector(hostname: str, per_call_selector: str | None) -> str | None:
+    """Return the effective CSS selector for *hostname*, or None.
+
+    Precedence (later wins):
+      1. Global config css_selector
+      2. Most-specific matching domain css_selector
+      3. per_call_selector (None = don't override)
+    """
+    val: str | None = _CONFIG["global"].get("css_selector")
+    for key in _matching_domain_keys(hostname, _CONFIG["domains"]):
+        domain = _CONFIG["domains"][key]
+        if "css_selector" in domain:
+            val = domain["css_selector"]
+    if per_call_selector is not None:
+        val = per_call_selector
+    return val
+
+
 # ---------------------------------------------------------------------------
 # Output formatting
 # ---------------------------------------------------------------------------
@@ -450,6 +489,25 @@ def _extract_text(html: str) -> str:
     text = re.sub(r"<[^>]+>", " ", html)
     text = re.sub(r"\s+", " ", text)
     return text.strip()
+
+
+def _apply_css_selector(html: str, selector: str) -> str:
+    """Extract elements matching *selector* from *html* and return them as HTML.
+
+    All matching elements are concatenated.  Falls back to the original HTML
+    if no elements match or if BeautifulSoup raises an exception.
+    """
+    try:
+        from bs4 import BeautifulSoup  # lazy import
+        soup = BeautifulSoup(html, "html.parser")
+        elements = soup.select(selector)
+        if not elements:
+            _log.warning("css_selector %r matched nothing; using full HTML", selector)
+            return html
+        return "\n".join(str(el) for el in elements)
+    except Exception as exc:
+        _log.warning("css_selector apply failed (%s); using full HTML", exc)
+        return html
 
 
 def _extract_trafilatura_metadata(raw_html: str) -> str | None:
@@ -542,10 +600,11 @@ async def fetch(
     max_bytes: int = 0,
     follow_redirects: bool = True,
     output_format: str | None = None,
+    css_selector: str | None = None,
 ) -> str:
     """
     Fetch a URL and return its response, injecting domain-scoped authentication
-    headers (e.g. Akamai bot-defender tokens) automatically.
+    headers (e.g. provider-specific authentication tokens) automatically.
 
     Args:
         url:              The URL to request.
@@ -562,6 +621,11 @@ async def fetch(
                           Accepted values: "raw" (default), "markdown",
                           "trafilatura", "json".
                           Ignored if extract_text=True (legacy compat).
+        css_selector:     CSS selector identifying the HTML element(s) to extract
+                          before applying the output format.  All matching
+                          elements are concatenated.  Overrides the domain-
+                          scoped css_selector from config for this request only.
+                          Only applied when Content-Type indicates HTML.
     """
     parsed = urlparse(url)
     hostname = parsed.hostname or ""
@@ -700,6 +764,13 @@ async def fetch(
         if effective_fmt == "raw" and "application/json" in content_type:
             effective_fmt = "json"
 
+    # --- CSS selector extraction ---
+    effective_selector = _resolve_css_selector(hostname, css_selector)
+    css_selector_applied = False
+    if effective_selector and "html" in content_type.lower():
+        content = _apply_css_selector(content, effective_selector)
+        css_selector_applied = True
+
     content = _apply_output_format(content, effective_fmt)
 
     # --- Metadata extraction (Feature 1) ---
@@ -744,6 +815,9 @@ async def fetch(
             f"\nSanitization:     {sanitize_mode} "
             f"({len(injection_warnings)} pattern(s) found)"
         )
+    if effective_selector:
+        applied_str = "applied" if css_selector_applied else "skipped (non-HTML content)"
+        extra_lines += f"\nCSS selector:     {effective_selector!r} ({applied_str})"
 
     summary = (
         f"--- Request Summary ---\n"

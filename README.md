@@ -134,7 +134,7 @@ cp .env.example .env
 **`WEBFETCH_HEADERS`** — domain-scoped request headers (single-line JSON):
 
 ```env
-WEBFETCH_HEADERS={"*": {"User-Agent": "MyBot/1.0"}, "example.com": {"X-Akamai-Token": "your-token"}}
+WEBFETCH_HEADERS={"*": {"User-Agent": "MyBot/1.0"}, "example.com": {"X-Auth-Token": "your-token"}}
 ```
 
 **`WEBFETCH_OUTPUT`** — domain-scoped output format (single-line JSON):
