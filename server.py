@@ -9,6 +9,7 @@ back to the legacy WEBFETCH_HEADERS / WEBFETCH_OUTPUT environment variables.
 """
 
 import asyncio
+import ipaddress
 import json
 import logging
 import os
@@ -31,6 +32,10 @@ _log = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 _VALID_OUTPUT_FORMATS = frozenset({"raw", "markdown", "trafilatura", "json"})
+
+# Default response-body cap (10 MB).  Prevents OOM when a remote server returns
+# an unexpectedly large payload.  Pass max_bytes=-1 to disable explicitly.
+_DEFAULT_MAX_BYTES = 10 * 1024 * 1024
 
 _VALID_SANITIZE_MODES = frozenset({"flag", "strip"})
 _VALID_BOT_BLOCK_MODES = frozenset({"report", "retry"})
@@ -71,7 +76,90 @@ _DEFAULT_GLOBAL: dict = {
     "sanitize_content": False,
     "bot_block_detection": False,
     "css_selector": None,
+    "allowed_domains": [],
+    "denied_domains": [],
 }
+
+# ---------------------------------------------------------------------------
+# SSRF protection
+# ---------------------------------------------------------------------------
+
+# RFC-1918 private ranges, loopback, link-local (AWS metadata endpoint), and
+# IPv6 loopback / unique-local.  Requests resolving to any of these are blocked
+# unless the operator explicitly configures an allowlist that includes the host.
+_PRIVATE_IP_RANGES = [
+    ipaddress.ip_network("127.0.0.0/8"),     # loopback IPv4
+    ipaddress.ip_network("10.0.0.0/8"),      # RFC-1918 class A
+    ipaddress.ip_network("172.16.0.0/12"),   # RFC-1918 class B
+    ipaddress.ip_network("192.168.0.0/16"),  # RFC-1918 class C
+    ipaddress.ip_network("169.254.0.0/16"),  # link-local / AWS metadata service
+    ipaddress.ip_network("0.0.0.0/8"),       # "this" network
+    ipaddress.ip_network("::1/128"),         # IPv6 loopback
+    ipaddress.ip_network("fc00::/7"),        # IPv6 unique-local (fc00:: and fd00::)
+    ipaddress.ip_network("fe80::/10"),       # IPv6 link-local
+]
+
+_ALLOWED_SCHEMES = frozenset({"http", "https"})
+
+# Hostnames that are always blocked regardless of how they resolve.
+_BLOCKED_HOSTNAMES = frozenset({"localhost", "ip6-localhost", "ip6-loopback"})
+
+
+def _validate_url(url: str, allowed_domains: list, denied_domains: list) -> None:
+    """Raise ValueError if *url* is disallowed.
+
+    Checks performed (in order):
+    1. URL scheme must be http or https.
+    2. Hostname must not be empty.
+    3. Hostname must not be in the blocked-hostname list.
+    4. If the hostname is a bare IP address it must not fall within any
+       private / reserved range.
+    5. If *denied_domains* is non-empty, the hostname must not match any entry.
+    6. If *allowed_domains* is non-empty, the hostname must match at least one
+       entry (suffix match, same logic as domain-header resolution).
+    """
+    parsed = urlparse(url)
+    scheme = (parsed.scheme or "").lower()
+    if scheme not in _ALLOWED_SCHEMES:
+        raise ValueError(
+            f"Disallowed URL scheme {scheme!r}. Only http and https are permitted."
+        )
+
+    host = (parsed.hostname or "").lower()
+    if not host:
+        raise ValueError("URL has no hostname.")
+
+    if host in _BLOCKED_HOSTNAMES:
+        raise ValueError(f"Disallowed host {host!r}: loopback/localhost is not permitted.")
+
+    try:
+        addr = ipaddress.ip_address(host)
+        for net in _PRIVATE_IP_RANGES:
+            if addr in net:
+                raise ValueError(
+                    f"Disallowed IP address {host!r}: falls within reserved range {net}."
+                )
+    except ValueError as exc:
+        if "Disallowed" in str(exc):
+            raise
+        # host is a domain name — not an IP literal; continue with domain checks
+
+    if denied_domains:
+        for entry in denied_domains:
+            entry_lower = entry.lower()
+            if host == entry_lower or host.endswith("." + entry_lower):
+                raise ValueError(
+                    f"Host {host!r} is in the denied_domains list ({entry!r})."
+                )
+
+    if allowed_domains:
+        for entry in allowed_domains:
+            entry_lower = entry.lower()
+            if host == entry_lower or host.endswith("." + entry_lower):
+                return  # host is explicitly allowed
+        raise ValueError(
+            f"Host {host!r} is not in the allowed_domains list."
+        )
 
 # ---------------------------------------------------------------------------
 # Config loading
@@ -220,6 +308,15 @@ def _merge_domain_section(target: dict, source: dict, *, context: str) -> None:
         val = source["css_selector"]
         target["css_selector"] = str(val) if val is not None else None
 
+    for list_key in ("allowed_domains", "denied_domains"):
+        if list_key in source:
+            val = source[list_key]
+            if not isinstance(val, list) or not all(isinstance(x, str) for x in val):
+                raise RuntimeError(
+                    f"'{context}.{list_key}' must be a list of strings, got {val!r}"
+                )
+            target[list_key] = [str(v).lower() for v in val]
+
 
 def _load_env_config() -> dict:
     """Build the canonical config dict from legacy environment variables."""
@@ -271,6 +368,16 @@ def _load_env_config() -> dict:
                 config["global"]["output_format"] = fmt
             else:
                 config["domains"].setdefault(key, {})["output_format"] = fmt
+
+    # --- WEBFETCH_ALLOWED_DOMAINS / WEBFETCH_DENIED_DOMAINS ---
+    for env_key, cfg_key in (
+        ("WEBFETCH_ALLOWED_DOMAINS", "allowed_domains"),
+        ("WEBFETCH_DENIED_DOMAINS", "denied_domains"),
+    ):
+        raw_domains_val = os.getenv(env_key, "")
+        if raw_domains_val:
+            entries = [d.strip().lower() for d in raw_domains_val.split(",") if d.strip()]
+            config["global"][cfg_key] = entries
 
     # --- WEBFETCH_SELECTORS ---
     raw_selectors = os.getenv("WEBFETCH_SELECTORS", "")
@@ -430,6 +537,13 @@ def _resolve_bot_block_detection(hostname: str) -> str | bool:
     return val
 
 
+def _resolve_allowed_denied_domains() -> tuple[list[str], list[str]]:
+    """Return (allowed_domains, denied_domains) from global config."""
+    allowed: list[str] = _CONFIG["global"].get("allowed_domains", [])
+    denied: list[str] = _CONFIG["global"].get("denied_domains", [])
+    return allowed, denied
+
+
 def _resolve_css_selector(hostname: str, per_call_selector: str | None) -> str | None:
     """Return the effective CSS selector for *hostname*, or None.
 
@@ -586,10 +700,27 @@ def _detect_bot_block(status_code: int, resp_headers: dict, body: str) -> str | 
 
 _INVALID_HEADER_RE = re.compile(r"[\r\n\x00]")
 
+# Headers that must not be overridden by callers to prevent HTTP request
+# smuggling and host-header injection attacks.
+_FORBIDDEN_HEADERS = frozenset({
+    "host",
+    "content-length",
+    "transfer-encoding",
+    "connection",
+    "upgrade",
+    "te",
+    "trailers",
+})
+
 
 def _validate_headers(headers: dict[str, str]) -> None:
-    """Raise ValueError if any header name or value contains \\r, \\n, or NUL."""
+    """Raise ValueError if any header is forbidden or contains control characters."""
     for name, value in headers.items():
+        if name.lower() in _FORBIDDEN_HEADERS:
+            raise ValueError(
+                f"Header {name!r} cannot be set by callers "
+                f"(potential HTTP request smuggling vector)."
+            )
         if _INVALID_HEADER_RE.search(name):
             raise ValueError(f"Invalid header name contains control character: {name!r}")
         if _INVALID_HEADER_RE.search(str(value)):
@@ -650,6 +781,9 @@ async def fetch(
     """
     parsed = urlparse(url)
     hostname = parsed.hostname or ""
+
+    allowed_domains, denied_domains = _resolve_allowed_denied_domains()
+    _validate_url(url, allowed_domains, denied_domains)
 
     if output_format is not None and output_format not in _VALID_OUTPUT_FORMATS:
         raise ValueError(
@@ -819,8 +953,17 @@ async def fetch(
         if metadata_block:
             content = metadata_block + "\n\n---\n\n" + content
 
-    if max_bytes > 0:
-        content = content[:max_bytes]
+    # Apply size cap: explicit max_bytes > 0 overrides default; -1 disables entirely.
+    effective_max_bytes: int
+    if max_bytes == -1:
+        effective_max_bytes = 0  # disabled
+    elif max_bytes > 0:
+        effective_max_bytes = max_bytes
+    else:
+        effective_max_bytes = _DEFAULT_MAX_BYTES
+
+    if effective_max_bytes > 0:
+        content = content[:effective_max_bytes]
 
     # --- Response assertions ---
     assertion_failures: list[str] = []
@@ -848,7 +991,14 @@ async def fetch(
             content = warning + "\n\n" + content
 
     injected = ", ".join(applied_header_names) if applied_header_names else "none"
-    truncated_str = f"yes (max_bytes={max_bytes})" if max_bytes > 0 else "no"
+    if effective_max_bytes > 0 and len(content) == effective_max_bytes:
+        truncated_str = f"yes (cap={effective_max_bytes})"
+    elif max_bytes == -1:
+        truncated_str = "no (cap disabled)"
+    elif effective_max_bytes > 0:
+        truncated_str = f"no (cap={effective_max_bytes})"
+    else:
+        truncated_str = "no"
     proxy_str = proxy or "none"
     retry_str = f"{actual_attempts}/{attempts}" if attempts > 1 else "disabled"
 

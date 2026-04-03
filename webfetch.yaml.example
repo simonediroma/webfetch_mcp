@@ -44,6 +44,25 @@ global:
   # Outbound HTTP proxy URL (null = no proxy, default)
   proxy: null
 
+  # SSRF / egress filtering — optional but recommended in enterprise deployments.
+  #
+  # allowed_domains: if non-empty, ONLY these domains (and their subdomains) may
+  #   be fetched.  All other hosts are blocked with a ValueError.
+  # denied_domains: if non-empty, requests to these domains (and their
+  #   subdomains) are always blocked, regardless of allowed_domains.
+  #
+  # Both lists use suffix matching: "example.com" matches "example.com" and
+  # "api.example.com" but NOT "notexample.com".
+  #
+  # Note: loopback (127.x, localhost), link-local (169.254.x — AWS metadata),
+  # and all RFC-1918 private ranges are ALWAYS blocked regardless of these lists.
+  #
+  # allowed_domains:
+  #   - "api.mycompany.com"
+  #   - "docs.mycompany.com"
+  # denied_domains:
+  #   - "internal.corp"
+
 # ---------------------------------------------------------------------------
 # Per-domain overrides
 # All fields are optional — only the fields present override the global value.

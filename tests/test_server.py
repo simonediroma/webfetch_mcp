@@ -583,7 +583,7 @@ class TestFetch:
         async_cm, _ = _make_async_client_mock(response)
         with patch("httpx.AsyncClient", return_value=async_cm):
             result = await self.server.fetch("http://example.com/", max_bytes=50)
-        assert "Truncated:        yes (max_bytes=50)" in result
+        assert "Truncated:        yes (cap=50)" in result
         assert "Response size:    1000 bytes" in result
 
     async def test_response_size_is_pre_truncation(self):
@@ -1140,3 +1140,165 @@ class TestPhase1BugFixes:
         assert "line2" not in result
         assert "A" in result
         assert "B" in result
+
+
+# ---------------------------------------------------------------------------
+# Phase 2 security tests
+# ---------------------------------------------------------------------------
+
+class TestValidateUrl:
+    """Unit tests for _validate_url SSRF protection."""
+
+    @pytest.fixture(autouse=True)
+    def _server(self, monkeypatch):
+        self.server = _reload_server(monkeypatch)
+
+    def test_valid_https_url_passes(self):
+        self.server._validate_url("https://example.com/page", [], [])
+
+    def test_valid_http_url_passes(self):
+        self.server._validate_url("http://example.com/page", [], [])
+
+    def test_file_scheme_blocked(self):
+        with pytest.raises(ValueError, match="scheme"):
+            self.server._validate_url("file:///etc/passwd", [], [])
+
+    def test_ftp_scheme_blocked(self):
+        with pytest.raises(ValueError, match="scheme"):
+            self.server._validate_url("ftp://example.com/", [], [])
+
+    def test_javascript_scheme_blocked(self):
+        with pytest.raises(ValueError, match="scheme"):
+            self.server._validate_url("javascript:alert(1)", [], [])
+
+    def test_localhost_blocked(self):
+        with pytest.raises(ValueError, match="loopback"):
+            self.server._validate_url("http://localhost/", [], [])
+
+    def test_loopback_ip_blocked(self):
+        with pytest.raises(ValueError, match="reserved range"):
+            self.server._validate_url("http://127.0.0.1/", [], [])
+
+    def test_loopback_127_x_blocked(self):
+        with pytest.raises(ValueError, match="reserved range"):
+            self.server._validate_url("http://127.1.2.3/", [], [])
+
+    def test_aws_metadata_blocked(self):
+        with pytest.raises(ValueError, match="reserved range"):
+            self.server._validate_url("http://169.254.169.254/latest/meta-data/", [], [])
+
+    def test_private_10_blocked(self):
+        with pytest.raises(ValueError, match="reserved range"):
+            self.server._validate_url("http://10.0.0.1/", [], [])
+
+    def test_private_192_168_blocked(self):
+        with pytest.raises(ValueError, match="reserved range"):
+            self.server._validate_url("http://192.168.1.100/", [], [])
+
+    def test_private_172_16_blocked(self):
+        with pytest.raises(ValueError, match="reserved range"):
+            self.server._validate_url("http://172.16.0.1/", [], [])
+
+    def test_ipv6_loopback_blocked(self):
+        with pytest.raises(ValueError, match="reserved range"):
+            self.server._validate_url("http://[::1]/", [], [])
+
+    def test_denied_domains_blocks_exact_match(self):
+        with pytest.raises(ValueError, match="denied_domains"):
+            self.server._validate_url("http://internal.corp/", [], ["internal.corp"])
+
+    def test_denied_domains_blocks_subdomain(self):
+        with pytest.raises(ValueError, match="denied_domains"):
+            self.server._validate_url("http://api.internal.corp/", [], ["internal.corp"])
+
+    def test_denied_domains_allows_unrelated_host(self):
+        self.server._validate_url("http://example.com/", [], ["internal.corp"])
+
+    def test_allowed_domains_permits_exact_match(self):
+        self.server._validate_url("http://api.example.com/", ["api.example.com"], [])
+
+    def test_allowed_domains_permits_subdomain(self):
+        self.server._validate_url("http://www.example.com/", ["example.com"], [])
+
+    def test_allowed_domains_blocks_non_listed(self):
+        with pytest.raises(ValueError, match="allowed_domains"):
+            self.server._validate_url("http://other.com/", ["example.com"], [])
+
+    def test_empty_allowed_and_denied_permits_public_host(self):
+        self.server._validate_url("https://github.com/", [], [])
+
+
+class TestFetchSsrfIntegration:
+    """Integration tests: _validate_url is called inside fetch()."""
+
+    @pytest.fixture(autouse=True)
+    def _server(self, monkeypatch):
+        self.server = _reload_server(monkeypatch)
+
+    async def test_fetch_blocks_localhost(self):
+        with pytest.raises(ValueError, match="loopback"):
+            await self.server.fetch("http://localhost/admin")
+
+    async def test_fetch_blocks_private_ip(self):
+        with pytest.raises(ValueError, match="reserved range"):
+            await self.server.fetch("http://192.168.1.1/")
+
+    async def test_fetch_blocks_file_scheme(self):
+        with pytest.raises(ValueError, match="scheme"):
+            await self.server.fetch("file:///etc/passwd")
+
+
+class TestValidateHeadersForbidden:
+    """Header hardening: forbidden headers must raise ValueError."""
+
+    @pytest.fixture(autouse=True)
+    def _server(self, monkeypatch):
+        self.server = _reload_server(monkeypatch)
+
+    def test_host_header_raises(self):
+        with pytest.raises(ValueError, match="Host"):
+            self.server._validate_headers({"Host": "evil.com"})
+
+    def test_content_length_header_raises(self):
+        with pytest.raises(ValueError, match="Content-Length"):
+            self.server._validate_headers({"Content-Length": "0"})
+
+    def test_transfer_encoding_header_raises(self):
+        with pytest.raises(ValueError, match="Transfer-Encoding"):
+            self.server._validate_headers({"Transfer-Encoding": "chunked"})
+
+    def test_connection_header_raises(self):
+        with pytest.raises(ValueError, match="Connection"):
+            self.server._validate_headers({"Connection": "close"})
+
+    def test_safe_header_passes(self):
+        self.server._validate_headers({"X-Custom-Token": "abc123"})
+
+    def test_case_insensitive_blocking(self):
+        with pytest.raises(ValueError):
+            self.server._validate_headers({"HOST": "evil.com"})
+
+
+class TestDefaultMaxBytes:
+    """Default 10 MB cap must be applied when max_bytes is not specified."""
+
+    @pytest.fixture(autouse=True)
+    def _server(self, monkeypatch):
+        self.server = _reload_server(monkeypatch)
+
+    async def test_default_cap_applied_shown_in_summary(self):
+        """Summary must show the effective cap even when max_bytes=0 (default)."""
+        response = _make_mock_response(200, "X" * 100)
+        async_cm, _ = _make_async_client_mock(response)
+        with patch("httpx.AsyncClient", return_value=async_cm):
+            result = await self.server.fetch("http://example.com/")
+        # Content is small — cap shown but not actually truncating
+        assert f"cap={self.server._DEFAULT_MAX_BYTES}" in result
+
+    async def test_explicit_minus_one_disables_cap(self):
+        """max_bytes=-1 must disable the cap entirely."""
+        response = _make_mock_response(200, "X" * 100)
+        async_cm, _ = _make_async_client_mock(response)
+        with patch("httpx.AsyncClient", return_value=async_cm):
+            result = await self.server.fetch("http://example.com/", max_bytes=-1)
+        assert "cap disabled" in result
