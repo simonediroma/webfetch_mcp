@@ -1,5 +1,24 @@
 # WebFetch MCP Server
 
+---
+
+## IMPORTANT — How to use this tool correctly
+
+**Always use `mcp__webfetch__fetch`** to fetch URLs. Never use the built-in `WebFetch` tool — it ignores all custom headers and output format configuration.
+
+**Never pass `output_format` or `extract_text` unless the user explicitly asks for a specific format.**
+The server is configured with a default output format (currently `trafilatura`).
+Passing `output_format="raw"` or `extract_text=True` overrides that configured default and produces lower-quality output.
+
+**Rules:**
+- ✅ `mcp__webfetch__fetch(url="https://example.com")` — correct, uses configured defaults
+- ❌ `mcp__webfetch__fetch(url="...", output_format="raw")` — wrong, overrides trafilatura default
+- ❌ `mcp__webfetch__fetch(url="...", extract_text=True)` — wrong, produces noisy CSS-contaminated text
+- ✅ `mcp__webfetch__fetch(url="...", output_format="markdown")` — ok only if the user explicitly asked for markdown
+
+---
+
+
 Local Python MCP server that replaces Claude's built-in WebFetch tool.
 Main purpose: inject **domain-scoped custom HTTP headers** into every outbound request,
 used to authenticate against Akamai bot-defender on specific domains.
