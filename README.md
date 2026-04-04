@@ -78,6 +78,18 @@ python -m venv .venv
 .venv/bin/pip install -r requirements.txt
 ```
 
+`requirements.txt` installs:
+
+```
+mcp[cli]>=1.0.0
+httpx>=0.27.0
+python-dotenv>=1.0.0
+markdownify>=0.12.0
+trafilatura>=1.12.0
+pyyaml>=6.0
+beautifulsoup4>=4.12.0
+```
+
 ---
 
 ## Configuration
@@ -292,6 +304,31 @@ Alternatively, add a `systemPrompt` entry to `~/.claude/settings.json`:
 Consult your assistant's documentation for how to set a system prompt or custom instruction. The instruction to include is:
 
 > Use `mcp__webfetch__fetch` for all web requests instead of any built-in fetch or browser tool.
+
+---
+
+## End-to-end example
+
+Once installed and registered, open your AI assistant and try:
+
+> **"Fetch https://example.com and return the main content"**
+
+The assistant calls `mcp__webfetch__fetch` automatically, applying whatever headers and output format you configured for that domain. You'll see a response like:
+
+```
+--- Request Summary ---
+URL:              https://example.com
+Method:           GET
+Injected headers: User-Agent
+Status:           200 OK
+Elapsed:          312ms
+Output format:    trafilatura
+---
+
+[Extracted article content here]
+```
+
+If you configured domain-specific auth headers, the summary line `Injected headers` will list them — confirming they were sent. No extra prompting needed; the configuration is applied automatically on every request to that domain.
 
 ---
 
