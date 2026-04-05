@@ -3,7 +3,7 @@
 ![Python](https://img.shields.io/badge/python-3.10%2B-blue)
 ![License](https://img.shields.io/badge/license-MIT-green)
 ![MCP](https://img.shields.io/badge/MCP-compatible-purple)
-[![simonediroma/webfetch_mcp MCP server](https://glama.ai/mcp/servers/simonediroma/webfetch_mcp/badges/score.svg)](https://glama.ai/mcp/servers/simonediroma/webfetch_mcp)
+[![simonediroma/webfetch_mcp MCP server](https://glama.ai/mcp/servers/@simonediroma/webfetch_mcp/badges/score.svg)](https://glama.ai/mcp/servers/@simonediroma/webfetch_mcp)
 
 A local Python MCP server that replaces your AI assistant's built-in `WebFetch` tool with a fully configurable HTTP client — supporting **domain-scoped headers, retries, proxies, timeouts, output formats, bot-block detection, and prompt-injection sanitization**, all without touching a single line of your assistant's config beyond registering the server.
 
