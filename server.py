@@ -146,6 +146,7 @@ _DEFAULT_GLOBAL: dict = {
     "tls_verify": True,
     "tls_ca_bundle": None,
     "tls_min_version": None,
+    "render_js": False,
 }
 
 # ---------------------------------------------------------------------------
@@ -423,6 +424,14 @@ def _merge_domain_section(target: dict, source: dict, *, context: str) -> None:
             )
         target["bot_block_detection"] = val
 
+    if "render_js" in source:
+        val = source["render_js"]
+        if not isinstance(val, bool):
+            raise RuntimeError(
+                f"'{context}.render_js' must be a boolean, got {type(val).__name__!r}"
+            )
+        target["render_js"] = val
+
     if "css_selector" in source:
         val = source["css_selector"]
         target["css_selector"] = str(val) if val is not None else None
@@ -539,6 +548,11 @@ def _load_env_config() -> dict:
                 config["global"]["css_selector"] = str(sel)
             else:
                 config["domains"].setdefault(key, {})["css_selector"] = str(sel)
+
+    # --- WEBFETCH_RENDER_JS ---
+    raw_render_js = os.getenv("WEBFETCH_RENDER_JS", "").strip().lower()
+    if raw_render_js in ("1", "true", "yes"):
+        config["global"]["render_js"] = True
 
     return config
 
@@ -724,6 +738,24 @@ def _resolve_css_selector(hostname: str, per_call_selector: str | None) -> str |
     if per_call_selector is not None:
         val = per_call_selector
     return val
+
+
+def _resolve_render_js(hostname: str, per_call: bool | None) -> bool:
+    """Return True if headless browser rendering is enabled for *hostname*.
+
+    Precedence (later wins):
+      1. Global config render_js
+      2. Most-specific matching domain render_js
+      3. per_call (None = don't override)
+    """
+    val: bool = _CONFIG["global"].get("render_js", False)
+    for key in _matching_domain_keys(hostname, _CONFIG["domains"]):
+        domain = _CONFIG["domains"][key]
+        if "render_js" in domain:
+            val = domain["render_js"]
+    if per_call is not None:
+        val = per_call
+    return bool(val)
 
 
 # ---------------------------------------------------------------------------
@@ -962,6 +994,60 @@ def _validate_headers(headers: dict[str, str]) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Headless browser fetch
+# ---------------------------------------------------------------------------
+
+async def _fetch_with_browser(
+    url: str,
+    headers: dict[str, str],
+    timeout: float,
+    proxy: str | None,
+) -> tuple[str, int]:
+    """Render *url* with Playwright Chromium and return (html, status_code).
+
+    Executes all JavaScript on the page and waits for network to be idle
+    before capturing the rendered HTML.  Falls back to status 200 when the
+    Playwright response object is unavailable.
+
+    Raises RuntimeError (with install instructions) if playwright is not
+    installed.
+    """
+    try:
+        from playwright.async_api import async_playwright  # lazy import
+    except ImportError:
+        raise RuntimeError(
+            "playwright is required for JS rendering but is not installed.\n"
+            "Install it with:\n"
+            "  pip install playwright\n"
+            "  playwright install chromium"
+        )
+
+    launch_kwargs: dict = {"headless": True}
+    context_kwargs: dict = {}
+    if proxy:
+        launch_kwargs["proxy"] = {"server": proxy}
+    if headers:
+        context_kwargs["extra_http_headers"] = headers
+
+    async with async_playwright() as pw:
+        browser = await pw.chromium.launch(**launch_kwargs)
+        try:
+            ctx = await browser.new_context(**context_kwargs)
+            page = await ctx.new_page()
+            resp = await page.goto(
+                url,
+                timeout=timeout * 1000,  # Playwright uses milliseconds
+                wait_until="networkidle",
+            )
+            html = await page.content()
+            status = resp.status if resp is not None else 200
+        finally:
+            await browser.close()
+
+    return html, status
+
+
+# ---------------------------------------------------------------------------
 # MCP tool
 # ---------------------------------------------------------------------------
 
@@ -979,6 +1065,7 @@ async def fetch(
     trace_redirects: bool = False,
     assert_status: int | None = None,
     assert_contains: str | None = None,
+    render_js: bool | None = None,
 ) -> str:
     """
     Fetch a URL and return its response, injecting domain-scoped authentication
@@ -1017,6 +1104,13 @@ async def fetch(
                           smoke tests (e.g. assert_status=200).
         assert_contains:  If set, raise an error when this string is not found
                           in the response body. Case-sensitive.
+        render_js:        If True, render the page with a headless Chromium browser
+                          (executes JavaScript) before applying output formatting.
+                          Requires playwright: pip install playwright &&
+                          playwright install chromium.
+                          Overrides the domain-scoped render_js config for this
+                          request only.  Default: None (use config, which defaults
+                          to False — plain HTTP via httpx).
     """
     parsed = urlparse(url)
     hostname = parsed.hostname or ""
@@ -1053,118 +1147,150 @@ async def fetch(
     tls_verify, tls_ca_bundle, tls_min_version = _resolve_tls_config(hostname)
     ssl_context = _build_ssl_context(tls_ca_bundle, tls_min_version, tls_verify)
 
-    client_kwargs: dict = {
-        "follow_redirects": follow_redirects,
-        "timeout": timeout,
-        "verify": ssl_context,
-    }
-    if proxy:
-        client_kwargs["proxy"] = proxy
+    effective_render_js = _resolve_render_js(hostname, render_js)
 
-    response = None
-    delay = 1.0
-    actual_attempts = 0
-    request_start = time.monotonic()
-
-    async with httpx.AsyncClient(**client_kwargs) as client:
-        for attempt in range(attempts):
-            actual_attempts = attempt + 1
-            try:
-                response = await client.request(
-                    method=method.upper(),
-                    url=url,
-                    headers=headers,
-                    content=body.encode() if body else None,
-                )
-                if response.status_code >= 500 and attempt < attempts - 1:
-                    _log.warning(
-                        "fetch attempt %d/%d returned HTTP %s; retrying in %.1fs",
-                        attempt + 1, attempts, response.status_code, delay,
-                    )
-                    await asyncio.sleep(delay)
-                    delay *= backoff_mult
-                    continue
-                break
-            except (httpx.TransportError, httpx.TimeoutException) as exc:
-                if attempt < attempts - 1:
-                    _log.warning(
-                        "fetch attempt %d/%d failed (%s); retrying in %.1fs",
-                        attempt + 1, attempts, exc, delay,
-                    )
-                    await asyncio.sleep(delay)
-                    delay *= backoff_mult
-                else:
-                    _log.error(
-                        "fetch %s %s failed after %d attempt(s): %s",
-                        method.upper(), url, attempts, exc,
-                    )
-                    raise
-
-    elapsed_ms = int((time.monotonic() - request_start) * 1000)
-
-    if response is None:
-        # Should not happen, but satisfy type checker
-        raise RuntimeError("No response received")
-
-    if response.is_error:
-        _log.warning("fetch %s %s returned HTTP %s", method.upper(), url, response.status_code)
-
-    content = response.text
-    raw_html = content  # preserve original for metadata extraction and bot-block scanning
-    response_size = len(content)
-
-    # --- Bot-block / paywall detection (Feature 3) ---
-    bot_block_mode = _resolve_bot_block_detection(hostname)
+    # Shared variables populated by either fetch path
+    content: str
+    raw_html: str
+    response_size: int
+    content_type: str
+    status_code: int
+    reason_phrase: str
+    elapsed_ms: int
+    actual_attempts: int
     bot_block_reason: str | None = None
-    chrome_retry_attempted = False
+    chrome_retry_attempted: bool = False
+    redirect_chain_str: str | None = None
 
-    if bot_block_mode and bot_block_mode in _VALID_BOT_BLOCK_MODES:
-        bot_block_reason = _detect_bot_block(
-            response.status_code,
-            dict(response.headers),
-            raw_html,
-        )
-        if bot_block_reason and bot_block_mode == "retry":
-            chrome_retry_attempted = True
-            retry_headers = {**headers, "User-Agent": _CHROME_UA}
-            _log.info("bot-block detected (%s); retrying with Chrome UA", bot_block_reason)
-            async with httpx.AsyncClient(**client_kwargs) as chrome_client:
+    if effective_render_js:
+        # --- Headless browser fetch (Playwright) ---
+        _log.info("fetch %s %s (render_js=True, timeout=%.1fs)", method.upper(), url, timeout)
+        request_start = time.monotonic()
+        html, status_code = await _fetch_with_browser(url, headers, timeout, proxy)
+        elapsed_ms = int((time.monotonic() - request_start) * 1000)
+        content = html
+        raw_html = html
+        response_size = len(html)
+        content_type = "text/html"
+        reason_phrase = "OK" if status_code == 200 else str(status_code)
+        actual_attempts = 1
+        if status_code >= 400:
+            _log.warning("fetch %s %s returned HTTP %s (browser)", method.upper(), url, status_code)
+    else:
+        # --- Plain HTTP fetch (httpx) ---
+        client_kwargs: dict = {
+            "follow_redirects": follow_redirects,
+            "timeout": timeout,
+            "verify": ssl_context,
+        }
+        if proxy:
+            client_kwargs["proxy"] = proxy
+
+        response = None
+        delay = 1.0
+        actual_attempts = 0
+        request_start = time.monotonic()
+
+        async with httpx.AsyncClient(**client_kwargs) as client:
+            for attempt in range(attempts):
+                actual_attempts = attempt + 1
                 try:
-                    chrome_resp = await chrome_client.request(
+                    response = await client.request(
                         method=method.upper(),
                         url=url,
-                        headers=retry_headers,
+                        headers=headers,
                         content=body.encode() if body else None,
                     )
-                    chrome_block = _detect_bot_block(
-                        chrome_resp.status_code,
-                        dict(chrome_resp.headers),
-                        chrome_resp.text[:8192],
-                    )
-                    if not chrome_block:
-                        # Chrome retry succeeded — use its response
-                        response = chrome_resp
-                        content = chrome_resp.text
-                        raw_html = content
-                        response_size = len(content)
-                        bot_block_reason = None
-                    else:
-                        _log.warning("Chrome UA retry also blocked: %s", chrome_block)
+                    if response.status_code >= 500 and attempt < attempts - 1:
+                        _log.warning(
+                            "fetch attempt %d/%d returned HTTP %s; retrying in %.1fs",
+                            attempt + 1, attempts, response.status_code, delay,
+                        )
+                        await asyncio.sleep(delay)
+                        delay *= backoff_mult
+                        continue
+                    break
                 except (httpx.TransportError, httpx.TimeoutException) as exc:
-                    _log.warning("Chrome UA retry failed: %s", exc)
+                    if attempt < attempts - 1:
+                        _log.warning(
+                            "fetch attempt %d/%d failed (%s); retrying in %.1fs",
+                            attempt + 1, attempts, exc, delay,
+                        )
+                        await asyncio.sleep(delay)
+                        delay *= backoff_mult
+                    else:
+                        _log.error(
+                            "fetch %s %s failed after %d attempt(s): %s",
+                            method.upper(), url, attempts, exc,
+                        )
+                        raise
 
-    # --- Redirect chain ---
-    redirect_chain_str: str | None = None
-    if trace_redirects and response.history:
-        lines = [
-            f"  {r.status_code}  {r.url}  →  {r.headers.get('location', '?')}"
-            for r in response.history
-        ]
-        lines.append(f"  {response.status_code}  {response.url}  (final)")
-        redirect_chain_str = "\n".join(lines)
+        elapsed_ms = int((time.monotonic() - request_start) * 1000)
+
+        if response is None:
+            # Should not happen, but satisfy type checker
+            raise RuntimeError("No response received")
+
+        if response.is_error:
+            _log.warning("fetch %s %s returned HTTP %s", method.upper(), url, response.status_code)
+
+        content = response.text
+        raw_html = content  # preserve original for metadata extraction and bot-block scanning
+        response_size = len(content)
+        status_code = response.status_code
+        reason_phrase = response.reason_phrase
+        content_type = response.headers.get("content-type", "")
+
+        # --- Bot-block / paywall detection (Feature 3) ---
+        bot_block_mode = _resolve_bot_block_detection(hostname)
+
+        if bot_block_mode and bot_block_mode in _VALID_BOT_BLOCK_MODES:
+            bot_block_reason = _detect_bot_block(
+                response.status_code,
+                dict(response.headers),
+                raw_html,
+            )
+            if bot_block_reason and bot_block_mode == "retry":
+                chrome_retry_attempted = True
+                retry_headers = {**headers, "User-Agent": _CHROME_UA}
+                _log.info("bot-block detected (%s); retrying with Chrome UA", bot_block_reason)
+                async with httpx.AsyncClient(**client_kwargs) as chrome_client:
+                    try:
+                        chrome_resp = await chrome_client.request(
+                            method=method.upper(),
+                            url=url,
+                            headers=retry_headers,
+                            content=body.encode() if body else None,
+                        )
+                        chrome_block = _detect_bot_block(
+                            chrome_resp.status_code,
+                            dict(chrome_resp.headers),
+                            chrome_resp.text[:8192],
+                        )
+                        if not chrome_block:
+                            # Chrome retry succeeded — use its response
+                            response = chrome_resp
+                            content = chrome_resp.text
+                            raw_html = content
+                            response_size = len(content)
+                            status_code = chrome_resp.status_code
+                            reason_phrase = chrome_resp.reason_phrase
+                            bot_block_reason = None
+                        else:
+                            _log.warning("Chrome UA retry also blocked: %s", chrome_block)
+                    except (httpx.TransportError, httpx.TimeoutException) as exc:
+                        _log.warning("Chrome UA retry failed: %s", exc)
+
+        # --- Redirect chain ---
+        if trace_redirects and response.history:
+            lines = [
+                f"  {r.status_code}  {r.url}  →  {r.headers.get('location', '?')}"
+                for r in response.history
+            ]
+            lines.append(f"  {response.status_code}  {response.url}  (final)")
+            redirect_chain_str = "\n".join(lines)
 
     # Detect JSON from Content-Type when no explicit format is set
-    content_type = response.headers.get("content-type", "")
     effective_fmt: str
     if extract_text:
         effective_fmt = "text"
@@ -1212,9 +1338,9 @@ async def fetch(
 
     # --- Response assertions ---
     assertion_failures: list[str] = []
-    if assert_status is not None and response.status_code != assert_status:
+    if assert_status is not None and status_code != assert_status:
         assertion_failures.append(
-            f"assert_status failed: expected {assert_status}, got {response.status_code}"
+            f"assert_status failed: expected {assert_status}, got {status_code}"
         )
     if assert_contains is not None and assert_contains not in content:
         assertion_failures.append(
@@ -1255,15 +1381,20 @@ async def fetch(
     else:
         truncated_str = "no"
     proxy_str = proxy or "none"
-    retry_str = f"{actual_attempts}/{attempts}" if attempts > 1 else "disabled"
+    if effective_render_js:
+        retry_str = "n/a (browser)"
+    else:
+        retry_str = f"{actual_attempts}/{attempts}" if attempts > 1 else "disabled"
 
     # Build optional extra summary lines for new features
     extra_lines = ""
-    if bot_block_mode:
-        reason_str = bot_block_reason if bot_block_reason else "none"
-        extra_lines += f"\nBot block:        {reason_str}"
-        if bot_block_mode == "retry":
-            extra_lines += f"\nChrome retry:     {'yes' if chrome_retry_attempted else 'no'}"
+    if not effective_render_js:
+        bot_block_mode = _resolve_bot_block_detection(hostname)
+        if bot_block_mode:
+            reason_str = bot_block_reason if bot_block_reason else "none"
+            extra_lines += f"\nBot block:        {reason_str}"
+            if bot_block_mode == "retry":
+                extra_lines += f"\nChrome retry:     {'yes' if chrome_retry_attempted else 'no'}"
     if extract_meta:
         extra_lines += f"\nMetadata:         {'extracted' if metadata_block else 'no'}"
     if sanitize_mode:
@@ -1294,11 +1425,12 @@ async def fetch(
         f"URL:              {url}\n"
         f"Method:           {method.upper()}\n"
         f"Injected headers: {injected}\n"
-        f"Status:           {response.status_code} {response.reason_phrase}\n"
+        f"Status:           {status_code} {reason_phrase}\n"
         f"Elapsed:          {elapsed_ms}ms\n"
         f"Response size:    {response_size} bytes\n"
         f"Output format:    {effective_fmt}\n"
         f"Text extracted:   {'yes' if extract_text else 'no'}\n"
+        f"JS rendering:     {'yes (playwright)' if effective_render_js else 'no'}\n"
         f"Truncated:        {truncated_str}\n"
         f"Timeout:          {timeout}s\n"
         f"Proxy:            {proxy_str}\n"
@@ -1311,7 +1443,7 @@ async def fetch(
         "url": url,
         "hostname": hostname,
         "method": method.upper(),
-        "status": response.status_code,
+        "status": status_code,
         "elapsed_ms": elapsed_ms,
         "response_bytes": response_size,
         "output_format": effective_fmt,
@@ -1319,6 +1451,7 @@ async def fetch(
         "proxy": proxy,
         "retry_attempt": actual_attempts,
         "bot_blocked": bot_block_reason,
+        "render_js": effective_render_js,
     })
     return f"{summary}\n\n{content}"
 

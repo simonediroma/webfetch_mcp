@@ -78,6 +78,19 @@ global:
   # denied_domains:
   #   - "internal.corp"
 
+  # Headless browser rendering — executes JavaScript before returning HTML.
+  #
+  # When true, pages are fetched using Playwright (headless Chromium) instead
+  # of plain HTTP.  The browser executes all JavaScript, waits for the network
+  # to be idle, then returns the fully rendered HTML.  All output format options
+  # (trafilatura, markdown, css_selector, etc.) still apply to the rendered HTML.
+  #
+  # Default: false (use plain HTTP via httpx — no JavaScript execution)
+  #
+  # Requires: pip install playwright && playwright install chromium
+  #
+  # render_js: false
+
 # ---------------------------------------------------------------------------
 # Per-domain overrides
 # All fields are optional — only the fields present override the global value.
@@ -110,3 +123,9 @@ domains:
     retry:
       attempts: 5
       backoff: 1.5
+
+  # A JavaScript-heavy SPA — use headless browser to render before extracting
+  spa.example.com:
+    render_js: true
+    output_format: trafilatura
+    timeout: 60
