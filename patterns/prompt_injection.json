@@ -1,0 +1,506 @@
+{
+  "version": "1.0",
+  "description": "Prompt injection detection patterns for WebFetch MCP. Disable individual patterns with 'enabled: false'. Add new patterns following the same schema.",
+  "patterns": [
+    {
+      "id": "pi-do-001",
+      "name": "ignore-previous-instructions",
+      "description": "Classic direct override: tells the model to ignore its system instructions.",
+      "pattern": "ignore\\s+all\\s+previous\\s+instructions?",
+      "flags": ["I"],
+      "severity": "critical",
+      "category": "direct_override",
+      "enabled": true
+    },
+    {
+      "id": "pi-do-002",
+      "name": "disregard-instructions",
+      "description": "Disregard variant of direct instruction override.",
+      "pattern": "disregard\\s+(?:all\\s+)?(?:previous|prior)\\s+instructions?",
+      "flags": ["I"],
+      "severity": "critical",
+      "category": "direct_override",
+      "enabled": true
+    },
+    {
+      "id": "pi-do-003",
+      "name": "forget-instructions",
+      "description": "Forget-variant of direct instruction override.",
+      "pattern": "forget\\s+(?:all\\s+)?(?:your\\s+)?(?:previous\\s+)?instructions?",
+      "flags": ["I"],
+      "severity": "critical",
+      "category": "direct_override",
+      "enabled": true
+    },
+    {
+      "id": "pi-do-004",
+      "name": "override-instructions",
+      "description": "Override keyword targeting system instructions.",
+      "pattern": "override\\s+(?:your\\s+)?(?:previous\\s+)?instructions?",
+      "flags": ["I"],
+      "severity": "critical",
+      "category": "direct_override",
+      "enabled": true
+    },
+    {
+      "id": "pi-do-005",
+      "name": "new-instructions-block",
+      "description": "Attempts to inject a new instructions block inline.",
+      "pattern": "new\\s+instructions?:\\s*\\n",
+      "flags": ["I"],
+      "severity": "critical",
+      "category": "direct_override",
+      "enabled": true
+    },
+    {
+      "id": "pi-do-006",
+      "name": "do-not-follow-instructions",
+      "description": "Negation-form instruction override.",
+      "pattern": "do\\s+not\\s+follow\\s+(?:your\\s+)?(?:previous\\s+)?instructions?",
+      "flags": ["I"],
+      "severity": "critical",
+      "category": "direct_override",
+      "enabled": true
+    },
+    {
+      "id": "pi-do-007",
+      "name": "stop-following-instructions",
+      "description": "Imperative to stop following instructions.",
+      "pattern": "(?:stop|cease)\\s+following\\s+(?:your\\s+)?instructions?",
+      "flags": ["I"],
+      "severity": "critical",
+      "category": "direct_override",
+      "enabled": true
+    },
+    {
+      "id": "pi-do-008",
+      "name": "reset-to-default",
+      "description": "Reset-to-default framing to bypass system configuration.",
+      "pattern": "reset\\s+(?:to\\s+)?(?:default|factory)\\s+(?:settings?|mode)",
+      "flags": ["I"],
+      "severity": "high",
+      "category": "direct_override",
+      "enabled": true
+    },
+    {
+      "id": "pi-ri-001",
+      "name": "you-are-now",
+      "description": "Role injection: assigns a new identity to the model.",
+      "pattern": "you\\s+are\\s+now\\s+(?:a|an)\\s+\\w+",
+      "flags": ["I"],
+      "severity": "high",
+      "category": "role_injection",
+      "enabled": true
+    },
+    {
+      "id": "pi-ri-002",
+      "name": "act-as",
+      "description": "Role injection: asks the model to act as a different entity.",
+      "pattern": "act\\s+as\\s+(?:a|an)\\s+\\w+",
+      "flags": ["I"],
+      "severity": "high",
+      "category": "role_injection",
+      "enabled": true
+    },
+    {
+      "id": "pi-ri-003",
+      "name": "pretend-to-be",
+      "description": "Role injection via pretend/roleplay framing.",
+      "pattern": "pretend\\s+(?:to\\s+be|you\\s+are)\\s+(?:a|an)\\s+\\w+",
+      "flags": ["I"],
+      "severity": "high",
+      "category": "role_injection",
+      "enabled": true
+    },
+    {
+      "id": "pi-ri-004",
+      "name": "roleplay-as",
+      "description": "Roleplay-based persona injection.",
+      "pattern": "roleplay\\s+as\\s+(?:a|an)\\s+\\w+",
+      "flags": ["I"],
+      "severity": "high",
+      "category": "role_injection",
+      "enabled": true
+    },
+    {
+      "id": "pi-ri-005",
+      "name": "from-now-on-you-are",
+      "description": "Persistent role injection starting from a trigger phrase.",
+      "pattern": "from\\s+now\\s+on[,\\s]+you\\s+(?:are|will\\s+be)",
+      "flags": ["I"],
+      "severity": "high",
+      "category": "role_injection",
+      "enabled": true
+    },
+    {
+      "id": "pi-ri-006",
+      "name": "behave-like",
+      "description": "Behavioural role injection.",
+      "pattern": "behave\\s+(?:like|as)\\s+(?:a|an)\\s+\\w+",
+      "flags": ["I"],
+      "severity": "high",
+      "category": "role_injection",
+      "enabled": true
+    },
+    {
+      "id": "pi-ri-007",
+      "name": "your-new-role-is",
+      "description": "Explicit role/persona assignment.",
+      "pattern": "your\\s+(?:new\\s+)?(?:role|identity|persona)\\s+is",
+      "flags": ["I"],
+      "severity": "high",
+      "category": "role_injection",
+      "enabled": true
+    },
+    {
+      "id": "pi-ri-008",
+      "name": "respond-as",
+      "description": "Directive to respond as a different entity.",
+      "pattern": "you\\s+(?:must|should|will)\\s+(?:always\\s+)?respond\\s+as",
+      "flags": ["I"],
+      "severity": "high",
+      "category": "role_injection",
+      "enabled": true
+    },
+    {
+      "id": "pi-ri-009",
+      "name": "switch-role-to",
+      "description": "Dynamic role/mode switching directive.",
+      "pattern": "switch\\s+(?:your\\s+)?(?:role|mode|persona)\\s+to",
+      "flags": ["I"],
+      "severity": "high",
+      "category": "role_injection",
+      "enabled": true
+    },
+    {
+      "id": "pi-ex-001",
+      "name": "system-prompt-label",
+      "description": "Attempt to inject or expose a system prompt via label.",
+      "pattern": "system\\s+prompt\\s*:",
+      "flags": ["I"],
+      "severity": "high",
+      "category": "extraction",
+      "enabled": true
+    },
+    {
+      "id": "pi-ex-002",
+      "name": "reveal-system-prompt",
+      "description": "Attempt to extract system instructions.",
+      "pattern": "reveal\\s+(?:your\\s+)?(?:system\\s+)?(?:prompt|instructions?)",
+      "flags": ["I"],
+      "severity": "high",
+      "category": "extraction",
+      "enabled": true
+    },
+    {
+      "id": "pi-ex-003",
+      "name": "print-system-prompt",
+      "description": "Print/output/display variant of system prompt extraction.",
+      "pattern": "(?:print|output|show|display)\\s+(?:your\\s+)?(?:full\\s+)?system\\s+(?:prompt|instructions?)",
+      "flags": ["I"],
+      "severity": "high",
+      "category": "extraction",
+      "enabled": true
+    },
+    {
+      "id": "pi-ex-004",
+      "name": "what-are-your-instructions",
+      "description": "Probing the model for its original instructions.",
+      "pattern": "what\\s+(?:are|were)\\s+your\\s+(?:original\\s+)?instructions?",
+      "flags": ["I"],
+      "severity": "medium",
+      "category": "extraction",
+      "enabled": true
+    },
+    {
+      "id": "pi-ex-005",
+      "name": "bypass-safety-filters",
+      "description": "Attempt to bypass content safety or guidelines.",
+      "pattern": "(?:ignore|bypass)\\s+(?:your\\s+)?(?:safety|content)\\s+(?:filters?|guidelines?)",
+      "flags": ["I"],
+      "severity": "high",
+      "category": "extraction",
+      "enabled": true
+    },
+    {
+      "id": "pi-ex-006",
+      "name": "jailbreak-dan",
+      "description": "Jailbreak keywords including DAN (Do Anything Now) variants.",
+      "pattern": "(?:jailbreak|DAN|do\\s+anything\\s+now)",
+      "flags": ["I"],
+      "severity": "high",
+      "category": "extraction",
+      "enabled": true
+    },
+    {
+      "id": "pi-ex-007",
+      "name": "confidential-prompt",
+      "description": "Framing system prompt as confidential to trick extraction.",
+      "pattern": "(?:confidential|secret)\\s+(?:system\\s+)?(?:prompt|instructions?)",
+      "flags": ["I"],
+      "severity": "medium",
+      "category": "extraction",
+      "enabled": true
+    },
+    {
+      "id": "pi-st-001",
+      "name": "pipe-delimited-special-tokens",
+      "description": "Special tokens used by GPT-style and other models to delimit roles.",
+      "pattern": "<\\|(?:system|user|assistant|im_start|im_end|endoftext)\\|>",
+      "flags": ["I"],
+      "severity": "critical",
+      "category": "special_tokens",
+      "enabled": true
+    },
+    {
+      "id": "pi-st-002",
+      "name": "llama-instruction-tokens",
+      "description": "Llama-2 instruction delimiters [INST] and [/INST].",
+      "pattern": "\\[INST\\]|\\[/INST\\]",
+      "flags": ["I"],
+      "severity": "critical",
+      "category": "special_tokens",
+      "enabled": true
+    },
+    {
+      "id": "pi-st-003",
+      "name": "hash-heading-role-tokens",
+      "description": "Hash-heading format role tokens used by some chat templates.",
+      "pattern": "###\\s*(?:System|Human|Assistant|Instruction):",
+      "flags": ["I"],
+      "severity": "critical",
+      "category": "special_tokens",
+      "enabled": true
+    },
+    {
+      "id": "pi-st-004",
+      "name": "llama-sys-block-markers",
+      "description": "Llama system block markers <<SYS>> and <</SYS>>.",
+      "pattern": "(?:<<SYS>>|<</SYS>>)",
+      "flags": ["I"],
+      "severity": "critical",
+      "category": "special_tokens",
+      "enabled": true
+    },
+    {
+      "id": "pi-st-005",
+      "name": "bracket-role-markers",
+      "description": "Bracket-style role markers [SYSTEM], [USER], [ASSISTANT].",
+      "pattern": "\\[SYSTEM\\]|\\[USER\\]|\\[ASSISTANT\\]",
+      "flags": ["I"],
+      "severity": "critical",
+      "category": "special_tokens",
+      "enabled": true
+    },
+    {
+      "id": "pi-ml-de-001",
+      "name": "de-ignore-instructions",
+      "description": "German: ignore all previous instructions.",
+      "pattern": "ignoriere\\s+alle\\s+(?:vorherigen\\s+)?(?:Anweisungen?|Instruktionen?)",
+      "flags": ["I"],
+      "severity": "medium",
+      "category": "multilingual",
+      "enabled": true
+    },
+    {
+      "id": "pi-ml-de-002",
+      "name": "de-you-are-now",
+      "description": "German: you are now X.",
+      "pattern": "du\\s+bist\\s+(?:jetzt\\s+)?(?:ein|eine)\\s+\\w+",
+      "flags": ["I"],
+      "severity": "medium",
+      "category": "multilingual",
+      "enabled": true
+    },
+    {
+      "id": "pi-ml-fr-001",
+      "name": "fr-ignore-instructions",
+      "description": "French: ignore all previous instructions.",
+      "pattern": "ignorez\\s+(?:toutes\\s+)?(?:les\\s+)?instructions?\\s+(?:pr\\u00e9c\\u00e9dentes?|ant\\u00e9rieures?)",
+      "flags": ["I"],
+      "severity": "medium",
+      "category": "multilingual",
+      "enabled": true
+    },
+    {
+      "id": "pi-ml-fr-002",
+      "name": "fr-you-are-now",
+      "description": "French: you are now X.",
+      "pattern": "tu\\s+es\\s+(?:maintenant\\s+)?(?:un|une)\\s+\\w+",
+      "flags": ["I"],
+      "severity": "medium",
+      "category": "multilingual",
+      "enabled": true
+    },
+    {
+      "id": "pi-ml-es-001",
+      "name": "es-ignore-instructions",
+      "description": "Spanish: ignore all previous instructions.",
+      "pattern": "ignora\\s+(?:todas\\s+)?(?:las\\s+)?instrucciones?\\s+(?:anteriores?|previas?)",
+      "flags": ["I"],
+      "severity": "medium",
+      "category": "multilingual",
+      "enabled": true
+    },
+    {
+      "id": "pi-ml-it-001",
+      "name": "it-ignore-instructions",
+      "description": "Italian: ignore all previous instructions.",
+      "pattern": "ignora\\s+(?:tutte\\s+)?(?:le\\s+)?istruzioni\\s+(?:precedenti|anteriori)",
+      "flags": ["I"],
+      "severity": "medium",
+      "category": "multilingual",
+      "enabled": true
+    },
+    {
+      "id": "pi-ml-pt-001",
+      "name": "pt-ignore-instructions",
+      "description": "Portuguese: ignore all previous instructions.",
+      "pattern": "ignore\\s+(?:todas\\s+)?(?:as\\s+)?instru(?:\\u00e7\\u00f5es|coes)\\s+anteriores",
+      "flags": ["I"],
+      "severity": "medium",
+      "category": "multilingual",
+      "enabled": true
+    },
+    {
+      "id": "pi-ml-nl-001",
+      "name": "nl-ignore-instructions",
+      "description": "Dutch: ignore all previous instructions.",
+      "pattern": "negeer\\s+(?:alle\\s+)?(?:vorige|eerdere)\\s+instructies?",
+      "flags": ["I"],
+      "severity": "medium",
+      "category": "multilingual",
+      "enabled": true
+    },
+    {
+      "id": "pi-ml-pl-001",
+      "name": "pl-ignore-instructions",
+      "description": "Polish: ignore all previous instructions.",
+      "pattern": "zignoruj\\s+(?:wszystkie\\s+)?poprzednie\\s+(?:instrukcje|polecenia)",
+      "flags": ["I"],
+      "severity": "medium",
+      "category": "multilingual",
+      "enabled": true
+    },
+    {
+      "id": "pi-ml-ru-001",
+      "name": "ru-ignore-instructions",
+      "description": "Russian: ignore all previous instructions.",
+      "pattern": "\u0438\u0433\u043d\u043e\u0440\u0438\u0440\u0443\u0439\\s+(?:\u0432\u0441\u0435\\s+)?\u043f\u0440\u0435\u0434\u044b\u0434\u0443\u0449\u0438\u0435\\s+\u0438\u043d\u0441\u0442\u0440\u0443\u043a\u0446\u0438\u0438",
+      "flags": ["I"],
+      "severity": "medium",
+      "category": "multilingual",
+      "enabled": true
+    },
+    {
+      "id": "pi-ml-ru-002",
+      "name": "ru-you-are-now",
+      "description": "Russian: you are now X.",
+      "pattern": "\u0442\u044b\\s+\u0442\u0435\u043f\u0435\u0440\u044c\\s+\\w+",
+      "flags": ["I"],
+      "severity": "medium",
+      "category": "multilingual",
+      "enabled": true
+    },
+    {
+      "id": "pi-ml-zh-001",
+      "name": "zh-ignore-instructions",
+      "description": "Chinese: ignore all previous instructions.",
+      "pattern": "\u5ffd\u7565(?:\u6240\u6709)?(?:\u4e4b\u524d\u7684?|\u4ee5\u524d\u7684?)?(?:\u6307\u4ee4|\u6307\u793a|\u547d\u4ee4)",
+      "flags": ["I"],
+      "severity": "medium",
+      "category": "multilingual",
+      "enabled": true
+    },
+    {
+      "id": "pi-ml-zh-002",
+      "name": "zh-you-are-now",
+      "description": "Chinese: you are now X.",
+      "pattern": "\u4f60(?:\u73b0\u5728)?\u662f(?:\u4e00\u4e2a|\u4e00\u540d)\\w+",
+      "flags": ["I"],
+      "severity": "medium",
+      "category": "multilingual",
+      "enabled": true
+    },
+    {
+      "id": "pi-ml-ja-001",
+      "name": "ja-ignore-instructions",
+      "description": "Japanese: ignore all previous instructions.",
+      "pattern": "(?:\u4ee5\u524d\u306e|\u524d\u306e)(?:\u5168\u3066\u306e?|\u3059\u3079\u3066\u306e?)?(?:\u6307\u793a|\u547d\u4ee4|\u30a4\u30f3\u30b9\u30c8\u30e9\u30af\u30b7\u30e7\u30f3)\u3092(?:\u7121\u8996|\u5fd8\u308c)",
+      "flags": ["I"],
+      "severity": "medium",
+      "category": "multilingual",
+      "enabled": true
+    },
+    {
+      "id": "pi-ml-ja-002",
+      "name": "ja-you-are-now",
+      "description": "Japanese: you are now X.",
+      "pattern": "\u3042\u306a\u305f\u306f(?:\u4eca|\u3053\u308c\u304b\u3089)(?:\\w+|[\u3041-\u3093]+|[\u30a1-\u30f3]+)\u3067\u3059",
+      "flags": ["I"],
+      "severity": "medium",
+      "category": "multilingual",
+      "enabled": true
+    },
+    {
+      "id": "pi-ml-ar-001",
+      "name": "ar-ignore-instructions",
+      "description": "Arabic: ignore all previous instructions.",
+      "pattern": "\u062a\u062c\u0627\u0647\u0644\\s+(?:\u062c\u0645\u064a\u0639\\s+)?\u0627\u0644\u062a\u0639\u0644\u064a\u0645\u0627\u062a\\s+\u0627\u0644\u0633\u0627\u0628\u0642\u0629",
+      "flags": ["I"],
+      "severity": "medium",
+      "category": "multilingual",
+      "enabled": true
+    },
+    {
+      "id": "pi-ob-001",
+      "name": "spaced-ignore",
+      "description": "Obfuscated 'ignore' with spaces, underscores, or dashes between letters.",
+      "pattern": "i[\\s_\\-]+g[\\s_\\-]+n[\\s_\\-]+o[\\s_\\-]+r[\\s_\\-]+e",
+      "flags": ["I"],
+      "severity": "medium",
+      "category": "obfuscation",
+      "enabled": true
+    },
+    {
+      "id": "pi-ob-002",
+      "name": "encoded-payload-preamble",
+      "description": "Payload encoded as base64/rot13/hex preceding a decode directive.",
+      "pattern": "(?:base64|rot13|hex)\\s*(?:decode|encoded)\\s*:",
+      "flags": ["I"],
+      "severity": "medium",
+      "category": "obfuscation",
+      "enabled": true
+    },
+    {
+      "id": "pi-ob-003",
+      "name": "bracket-spaced-role-markers",
+      "description": "Role markers with internal whitespace to evade simple string matching.",
+      "pattern": "\\[\\s*(?:system|user|assistant)\\s*\\]",
+      "flags": ["I"],
+      "severity": "medium",
+      "category": "obfuscation",
+      "enabled": true
+    },
+    {
+      "id": "pi-ob-004",
+      "name": "html-comment-injection",
+      "description": "Injection directive hidden inside an HTML comment.",
+      "pattern": "<!--.*?-->\\s*(?:ignore|disregard|forget)",
+      "flags": ["I", "S"],
+      "severity": "medium",
+      "category": "obfuscation",
+      "enabled": true
+    },
+    {
+      "id": "pi-ob-005",
+      "name": "css-comment-injection",
+      "description": "Injection directive hidden inside a CSS block comment.",
+      "pattern": "/\\*.*?\\*/\\s*(?:ignore|disregard|forget)",
+      "flags": ["I", "S"],
+      "severity": "medium",
+      "category": "obfuscation",
+      "enabled": true
+    }
+  ]
+}

@@ -48,7 +48,9 @@ _DEFAULT_MAX_BYTES = 10 * 1024 * 1024
 _VALID_SANITIZE_MODES = frozenset({"flag", "strip"})
 _VALID_BOT_BLOCK_MODES = frozenset({"report", "retry"})
 
-_INJECTION_PATTERNS = [
+# Hard-coded fallback patterns (never overwritten).
+# _INJECTION_PATTERNS is replaced at startup by _load_injection_patterns().
+_INJECTION_PATTERNS_FALLBACK: list[re.Pattern] = [
     re.compile(r"ignore\s+all\s+previous\s+instructions?", re.I),
     re.compile(r"you\s+are\s+now\s+(?:a|an)\s+\w+", re.I),
     re.compile(r"act\s+as\s+(?:a|an)\s+\w+", re.I),
@@ -57,6 +59,61 @@ _INJECTION_PATTERNS = [
     re.compile(r"system\s+prompt\s*:", re.I),
     re.compile(r"<\|(?:system|user|assistant)\|>", re.I),
 ]
+_INJECTION_PATTERNS: list[re.Pattern] = _INJECTION_PATTERNS_FALLBACK[:]
+# Populated at startup by _load_injection_patterns(); parallel to _INJECTION_PATTERNS.
+_INJECTION_PATTERN_METADATA: list[dict] = []
+_PATTERNS_FILE = Path(__file__).parent / "patterns" / "prompt_injection.json"
+
+
+def _load_injection_patterns() -> tuple[list[re.Pattern], list[dict]]:
+    """Load prompt-injection patterns from patterns/prompt_injection.json.
+
+    Falls back to the 7 hardcoded patterns if the file is absent, unreadable,
+    or structurally invalid. Patterns whose 'enabled' field is false are skipped.
+    Returns (compiled_patterns, metadata_list) in lock-step order.
+    """
+    fallback = _INJECTION_PATTERNS_FALLBACK[:]
+    try:
+        with open(_PATTERNS_FILE, encoding="utf-8") as fh:
+            raw = json.load(fh)
+    except FileNotFoundError:
+        _log.info("Injection pattern file not found (%s); using defaults", _PATTERNS_FILE)
+        return fallback, []
+    except (json.JSONDecodeError, OSError) as exc:
+        _log.warning("Cannot load injection patterns from %s: %s; using defaults", _PATTERNS_FILE, exc)
+        return fallback, []
+
+    entries = raw.get("patterns")
+    if not isinstance(entries, list):
+        _log.warning("Injection pattern file missing 'patterns' list; using defaults")
+        return fallback, []
+
+    flag_map = {"I": re.I, "M": re.M, "S": re.S, "X": re.X}
+    compiled: list[re.Pattern] = []
+    meta: list[dict] = []
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        if not entry.get("enabled", True):
+            continue
+        pat_str = entry.get("pattern")
+        if not pat_str:
+            continue
+        flags = 0
+        for f in entry.get("flags", ["I"]):
+            flags |= flag_map.get(f.upper(), 0)
+        try:
+            compiled.append(re.compile(pat_str, flags))
+            meta.append(entry)
+        except re.error as exc:
+            _log.warning("Skipping invalid injection pattern %r: %s", pat_str, exc)
+
+    if not compiled:
+        _log.warning("No valid injection patterns loaded from file; using defaults")
+        return fallback, []
+
+    _log.info("Loaded %d injection patterns from %s", len(compiled), _PATTERNS_FILE)
+    return compiled, meta
 
 _BOT_BLOCK_STATUS_CODES = frozenset({403, 429, 503})
 _BOT_BLOCK_HEADER_SIGNALS = {"cf-ray", "cf-mitigated"}
@@ -497,6 +554,7 @@ _log.info(
     len(_CONFIG["domains"]),
     "YAML" if os.getenv("WEBFETCH_CONFIG") else "env",
 )
+_INJECTION_PATTERNS, _INJECTION_PATTERN_METADATA = _load_injection_patterns()
 
 # ---------------------------------------------------------------------------
 # Domain-matching resolution helpers
@@ -773,14 +831,35 @@ def _sanitize_content(content: str, mode: str) -> tuple[str, list[str]]:
     Returns ``(content, matched_patterns)`` where *content* is optionally
     modified (in ``"strip"`` mode) and *matched_patterns* lists the regex
     patterns that fired.
+
+    Detection is performed against a NFKD-normalized copy of the content so
+    that Unicode homoglyphs (e.g. Cyrillic 'і' vs Latin 'i') and zero-width
+    characters do not bypass pattern matching.  In 'strip' mode the substitution
+    is applied to the original (non-normalised) content to preserve legitimate
+    accented characters.
     """
+    import unicodedata
+    content_norm = unicodedata.normalize("NFKD", content)
     matched: list[str] = []
     for pat in _INJECTION_PATTERNS:
-        if pat.search(content):
+        if pat.search(content_norm):
             matched.append(pat.pattern)
             if mode == "strip":
                 content = pat.sub("[REMOVED]", content)
     return content, matched
+
+
+def _severity_for_pattern(pattern_str: str) -> str:
+    """Return the severity level for a matched pattern string.
+
+    Looks up *pattern_str* in *_INJECTION_PATTERN_METADATA*.
+    Returns ``'medium'`` as the default when metadata is unavailable
+    (e.g. fallback mode) or when the severity field is absent.
+    """
+    for entry in _INJECTION_PATTERN_METADATA:
+        if entry.get("pattern") == pattern_str:
+            return entry.get("severity", "medium")
+    return "medium"
 
 
 def _detect_bot_block(status_code: int, resp_headers: dict, body: str) -> str | None:
@@ -1105,9 +1184,19 @@ async def fetch(
     if sanitize_mode and sanitize_mode in _VALID_SANITIZE_MODES:
         content, injection_warnings = _sanitize_content(content, sanitize_mode)
         if injection_warnings and sanitize_mode == "flag":
+            _SEV_RANK = {"low": 0, "medium": 1, "high": 2, "critical": 3}
+            severities = [_severity_for_pattern(p) for p in injection_warnings]
+            max_sev = max(severities, key=lambda s: _SEV_RANK.get(s, 1))
+            sev_counts: dict[str, int] = {}
+            for s in severities:
+                sev_counts[s] = sev_counts.get(s, 0) + 1
+            sev_summary = ", ".join(
+                f"{v} {k}"
+                for k, v in sorted(sev_counts.items(), key=lambda x: -_SEV_RANK.get(x[0], 1))
+            )
             warning = (
-                "\n\n⚠️ **PROMPT INJECTION WARNING:** "
-                "Suspicious patterns detected in fetched content."
+                f"\n\n⚠️ **PROMPT INJECTION WARNING [{max_sev.upper()}]:** "
+                f"Suspicious patterns detected ({sev_summary})."
             )
             content = warning + "\n\n" + content
 
