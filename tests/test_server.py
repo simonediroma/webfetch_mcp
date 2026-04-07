@@ -4,14 +4,12 @@ Tests for server.py
 Run with:
     pytest tests/test_server.py -v
 """
-import importlib
 import json
 import sys
 import textwrap
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -69,7 +67,7 @@ class TestLoadConfigEnv:
 
     def test_valid_headers_json(self, monkeypatch):
         srv = _reload_server(monkeypatch, env_value='{"*": {"User-Agent": "Bot"}}')
-        assert srv._CONFIG["global"]["headers"] == {"User-Agent": "Bot"}
+        assert srv._CONFIG["global"]["headers"] == {"user-agent": "Bot"}
 
     def test_missing_env_vars_returns_defaults(self, monkeypatch):
         srv = _reload_server(monkeypatch)
@@ -96,7 +94,7 @@ class TestLoadConfigEnv:
             monkeypatch,
             env_value='{"*": {"UA": "bot"}, "example.com": {"X-Token": "abc"}}',
         )
-        assert srv._CONFIG["domains"]["example.com"]["headers"] == {"X-Token": "abc"}
+        assert srv._CONFIG["domains"]["example.com"]["headers"] == {"x-token": "abc"}
 
     def test_output_format_global(self, monkeypatch):
         srv = _reload_server(monkeypatch, output_value='{"*": "markdown"}')
@@ -142,12 +140,12 @@ class TestLoadConfigYaml:
                 output_format: trafilatura
         """))
         srv = _reload_server(monkeypatch, config_path=str(yaml_file))
-        assert srv._CONFIG["global"]["headers"] == {"User-Agent": "TestBot"}
+        assert srv._CONFIG["global"]["headers"] == {"user-agent": "TestBot"}
         assert srv._CONFIG["global"]["output_format"] == "markdown"
         assert srv._CONFIG["global"]["timeout"] == 45.0
         assert srv._CONFIG["global"]["retry"] == {"attempts": 3, "backoff": 1.5}
         assert srv._CONFIG["global"]["proxy"] == "http://proxy:8080"
-        assert srv._CONFIG["domains"]["example.com"]["headers"] == {"X-Token": "abc"}
+        assert srv._CONFIG["domains"]["example.com"]["headers"] == {"x-token": "abc"}
         assert srv._CONFIG["domains"]["example.com"]["output_format"] == "trafilatura"
 
     def test_yaml_missing_file_raises(self, monkeypatch, tmp_path):
@@ -169,7 +167,7 @@ class TestLoadConfigYaml:
         yaml_file.write_text("{}\n")
         srv = _reload_server(monkeypatch, config_path=str(yaml_file))
         assert srv._CONFIG["domains"] == {}
-        assert srv._CONFIG["global"]["output_format"] == "raw"
+        assert srv._CONFIG["global"]["output_format"] == "trafilatura"
 
     def test_yaml_invalid_output_format_raises(self, monkeypatch, tmp_path):
         yaml_file = tmp_path / "webfetch.yaml"
@@ -236,7 +234,7 @@ class TestResolveHeaders:
     def test_per_call_override_wins_over_domain(self):
         self._set_config({}, {"example.com": {"X-Token": "domain-value"}})
         result = self.server._resolve_headers("example.com", {"X-Token": "call-value"})
-        assert result["X-Token"] == "call-value"
+        assert result["x-token"] == "call-value"
 
     def test_no_config_no_extra_returns_empty(self):
         self._set_config({})
@@ -246,7 +244,7 @@ class TestResolveHeaders:
     def test_extra_headers_only(self):
         self._set_config({})
         result = self.server._resolve_headers("example.com", {"X-Custom": "yes"})
-        assert result == {"X-Custom": "yes"}
+        assert result == {"x-custom": "yes"}
 
 
 # ---------------------------------------------------------------------------
@@ -626,8 +624,13 @@ class TestFetch:
         call_kwargs = mock_cls.call_args.kwargs
         assert "proxy" not in call_kwargs
 
-    async def test_json_content_type_auto_detected(self):
+    async def test_json_content_type_auto_detected(self, monkeypatch):
+        """JSON auto-detection only triggers when output_format resolves to 'raw'."""
         import json
+        monkeypatch.setattr(self.server, "_CONFIG", {
+            "global": {**self.server._DEFAULT_GLOBAL, "output_format": "raw"},
+            "domains": {},
+        })
         payload = json.dumps({"key": "value"})
         response = _make_mock_response(200, payload, content_type="application/json; charset=utf-8")
         async_cm, _ = _make_async_client_mock(response)
@@ -748,7 +751,7 @@ class TestExtractTrafilaturaMetadata:
     """Unit tests for _extract_trafilatura_metadata()."""
 
     def setup_method(self):
-        import importlib, sys
+        import sys
         sys.modules.pop("server", None)
         import server
         self.server = server
@@ -781,7 +784,7 @@ class TestExtractTrafilaturaMetadata:
             "server._extract_trafilatura_metadata",
             lambda html: None,
         )
-        result = server._extract_trafilatura_metadata.__wrapped__(
+        _ = server._extract_trafilatura_metadata.__wrapped__(
             "<html></html>"
         ) if hasattr(server._extract_trafilatura_metadata, "__wrapped__") else None
         # Just verify the function doesn't raise
@@ -1084,8 +1087,6 @@ class TestInjectionPatternLoader:
 
     def test_full_json_file_loads_all_patterns(self):
         """The real patterns/prompt_injection.json should load ≥ 30 enabled patterns."""
-        import importlib
-        import sys
         # Use the real file path
         self.server._PATTERNS_FILE = (
             self.server.Path(__file__).parent.parent / "patterns" / "prompt_injection.json"
@@ -1531,8 +1532,6 @@ class TestAuditLogging:
         response = _make_mock_response(200, "<html>ok</html>")
         async_cm, _ = _make_async_client_mock(response)
         emitted: list[dict] = []
-
-        original = self.server._emit_audit_event
 
         def capture(event):
             emitted.append(event)

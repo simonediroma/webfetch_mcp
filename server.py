@@ -1015,7 +1015,6 @@ async def fetch(
         client_kwargs["proxy"] = proxy
 
     response = None
-    last_exc: Exception | None = None
     delay = 1.0
     actual_attempts = 0
     request_start = time.monotonic()
@@ -1040,7 +1039,6 @@ async def fetch(
                     continue
                 break
             except (httpx.TransportError, httpx.TimeoutException) as exc:
-                last_exc = exc
                 if attempt < attempts - 1:
                     _log.warning(
                         "fetch attempt %d/%d failed (%s); retrying in %.1fs",
