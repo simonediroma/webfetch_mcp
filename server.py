@@ -39,7 +39,7 @@ _AUDIT_ENABLED: bool = os.getenv("WEBFETCH_AUDIT_LOG", "").strip() in ("1", "tru
 # Constants
 # ---------------------------------------------------------------------------
 
-_VALID_OUTPUT_FORMATS = frozenset({"raw", "markdown", "trafilatura", "json"})
+_VALID_OUTPUT_FORMATS = frozenset({"raw", "markdown", "trafilatura", "json", "lighthtml"})
 
 # Default response-body cap (10 MB).  Prevents OOM when a remote server returns
 # an unexpectedly large payload.  Pass max_bytes=-1 to disable explicitly.
@@ -763,8 +763,55 @@ def _apply_output_format(content: str, fmt: str) -> str:
         except json.JSONDecodeError:
             _log.warning("output_format=json but response is not valid JSON; returning raw")
             return content
+    if fmt == "lighthtml":
+        return _apply_lighthtml(content)
     _log.error("Unknown output format %r; returning raw content", fmt)
     return content
+
+
+def _apply_lighthtml(html: str) -> str:
+    """
+    Return a lightweight version of *html* with all noise stripped.
+
+    Removes:
+    - <style> tags (and their content)
+    - Inline style attributes
+    - All <script> tags EXCEPT type="application/ld+json"
+    - HTML comments
+    - All tag attributes (class, id, data-*, aria-*, etc.)
+
+    JSON-LD <script> blocks are kept with only their ``type`` attribute.
+    Falls back to raw HTML if BeautifulSoup is unavailable or raises.
+    """
+    try:
+        from bs4 import BeautifulSoup, Comment  # lazy import
+
+        soup = BeautifulSoup(html, "html.parser")
+
+        # Remove <style> blocks
+        for tag in soup.find_all("style"):
+            tag.decompose()
+
+        # Remove <script> blocks except JSON-LD
+        for tag in soup.find_all("script"):
+            if tag.get("type", "").lower() != "application/ld+json":
+                tag.decompose()
+
+        # Remove HTML comments
+        for comment in soup.find_all(string=lambda text: isinstance(text, Comment)):
+            comment.extract()
+
+        # Strip all attributes; restore type="application/ld+json" on kept scripts
+        for tag in soup.find_all(True):
+            if tag.name and tag.name.lower() == "script":
+                tag.attrs = {"type": "application/ld+json"}
+            else:
+                tag.attrs = {}
+
+        return str(soup)
+    except Exception as exc:
+        _log.warning("lighthtml apply failed (%s); returning raw HTML", exc)
+        return html
 
 
 def _extract_text(html: str) -> str:
