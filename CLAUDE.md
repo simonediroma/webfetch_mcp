@@ -84,6 +84,7 @@ WEBFETCH_OUTPUT={"*": "raw", "example.com": "trafilatura", "news.com": "markdown
 | `"raw"` | Return raw HTML as-is (default) |
 | `"markdown"` | Convert full HTML to Markdown via `markdownify` |
 | `"trafilatura"` | Extract main content and return as Markdown via `trafilatura` (falls back to raw if extraction fails) |
+| `"lighthtml"` | Strip `<style>`, `<script>` (except JSON-LD), comments, and all tag attributes; returns minimal HTML structure |
 
 Merge order (later wins): `*` → domain-specific → per-call `output_format` parameter.
 
