@@ -27,7 +27,7 @@ jobs:
         run: pip install -r requirements.txt
 
       - name: Install dev tools
-        run: pip install ruff mypy bandit pytest-asyncio
+        run: pip install ruff mypy bandit pytest-asyncio types-PyYAML
 
       - name: Lint (ruff)
         run: ruff check server.py tests/
