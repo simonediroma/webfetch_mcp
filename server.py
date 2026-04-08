@@ -1055,7 +1055,7 @@ async def _fetch_with_browser(
 async def fetch(
     url: str,
     method: str = "GET",
-    body: str | None = None,
+    body: str | dict | list | None = None,
     extra_headers: dict | None = None,
     extract_text: bool = False,
     max_bytes: int = 0,
@@ -1074,7 +1074,8 @@ async def fetch(
     Args:
         url:              The URL to request.
         method:           HTTP method (GET, POST, PUT, DELETE, …). Default: GET.
-        body:             Optional request body string (for POST/PUT).
+        body:             Optional request body (for POST/PUT). Accepts a string
+                          or a dict/list (automatically serialized to JSON).
         extra_headers:    Additional headers to send for this request only.
                           Merged on top of the base domain headers.
         extract_text:     DEPRECATED — do not use. Produces low-quality output
@@ -1185,6 +1186,13 @@ async def fetch(
         }
         if proxy:
             client_kwargs["proxy"] = proxy
+
+        # Serialize dict/list bodies to JSON automatically
+        if isinstance(body, (dict, list)):
+            import json
+            body = json.dumps(body)
+            if not any(k.lower() == "content-type" for k in headers):
+                headers["Content-Type"] = "application/json"
 
         response = None
         delay = 1.0
