@@ -25,7 +25,7 @@ This server is a drop-in replacement: it exposes the same `fetch` tool to any MC
 | **Configurable timeout** | Per-domain request timeout (default 30 s) |
 | **Retry with backoff** | Auto-retry on HTTP 5xx or network errors, with exponential backoff |
 | **Per-domain proxy** | Route traffic through a different proxy per domain |
-| **Output formats** | `raw`, `markdown`, `trafilatura` (main content), `json` (pretty-print) |
+| **Output formats** | `raw`, `markdown`, `trafilatura` (main content), `json` (pretty-print), `lighthtml` (minimal HTML) |
 | **JSON auto-detection** | Responses with `application/json` Content-Type are pretty-printed automatically |
 | **Metadata extraction** | Extracts title, author, date, source via trafilatura (opt-in per domain) |
 | **Bot-block detection** | Detects Cloudflare / CAPTCHA blocks; optionally retries with a Chrome User-Agent |
@@ -36,6 +36,8 @@ This server is a drop-in replacement: it exposes the same `fetch` tool to any MC
 | **Header injection protection** | Validates headers for control characters (`\r`, `\n`, NUL) |
 | **Response truncation** | `max_bytes` cap to avoid filling the assistant's context window |
 | **Detailed response summary** | Every response includes a structured summary (status, elapsed ms, injected headers, format, etc.) |
+| **JS rendering (Playwright)** | Render JavaScript-heavy SPAs with headless Chromium before extracting content; configurable globally, per-domain, or per-call |
+| **lighthtml output format** | Strips `<style>`, `<script>` (except JSON-LD), comments, and all tag attributes — returns minimal bare HTML structure |
 
 ---
 
@@ -91,6 +93,12 @@ pyyaml>=6.0
 beautifulsoup4>=4.12.0
 ```
 
+**Optional — JS rendering** requires Playwright:
+
+```bash
+pip install playwright && playwright install chromium
+```
+
 ---
 
 ## Configuration
@@ -119,7 +127,7 @@ export WEBFETCH_CONFIG=/absolute/path/to/webfetch.yaml
 global:
   headers:
     User-Agent: "MyBot/1.0"
-  output_format: raw       # raw | markdown | trafilatura | json
+  output_format: raw       # raw | markdown | trafilatura | json | lighthtml
   timeout: 30              # seconds
   retry:
     attempts: 1            # 1 = no retry
@@ -129,6 +137,7 @@ global:
   sanitize_content: false  # false | "flag" | "strip"
   bot_block_detection: false  # false | "report" | "retry"
   css_selector: null       # CSS selector to extract element(s) before format conversion
+  render_js: false           # true = render JS via headless Chromium (requires playwright)
 
 # Per-domain overrides — only the fields you list are overridden
 domains:
@@ -346,11 +355,12 @@ All parameters are optional except `url`.
 | `extract_text` | `bool` | `False` | Strip HTML tags, return plain text (legacy; overrides `output_format`) |
 | `max_bytes` | `int` | `0` | Truncate response to N characters (0 = unlimited) |
 | `follow_redirects` | `bool` | `True` | Follow HTTP redirects |
-| `output_format` | `str \| None` | `None` | Per-call format override: `"raw"`, `"markdown"`, `"trafilatura"`, `"json"` |
+| `output_format` | `str \| None` | `None` | Per-call format override: `"raw"`, `"markdown"`, `"trafilatura"`, `"json"`, `"lighthtml"` |
 | `css_selector` | `str \| None` | `None` | CSS selector to extract HTML element(s) before format conversion (e.g. `"article"`, `"#main"`) |
 | `trace_redirects` | `bool` | `False` | Display the full redirect chain in the summary |
 | `assert_status` | `int \| None` | `None` | Raise an error if the response status code does not match this value |
 | `assert_contains` | `str \| None` | `None` | Raise an error if this string is not found in the response body (case-sensitive) |
+| `render_js` | `bool \| None` | `None` | Render the page with headless Chromium (executes JS, waits for network idle). Requires `playwright`. |
 
 ### Response format
 
@@ -366,6 +376,7 @@ Elapsed:          843ms
 Response size:    42381 bytes
 Output format:    trafilatura
 Text extracted:   no
+JS rendering:     no
 Truncated:        no
 Timeout:          60.0s
 Proxy:            none
@@ -521,6 +532,42 @@ The summary will show each hop:
 Redirect chain:
   301  https://short.ly/abc123  →  https://example.com/landing
   200  https://example.com/landing  (final)
+```
+
+---
+
+### Leverage Cloudflare content negotiation for LLM-ready Markdown
+
+Cloudflare's [Markdown for Agents](https://blog.cloudflare.com/markdown-for-agents/) feature converts HTML to Markdown at the edge when the request includes an `Accept: text/markdown` header. This cuts token usage by ~80% compared to raw HTML — and the conversion happens server-side, so it's faster and more accurate than any local HTML-to-Markdown pipeline.
+
+With webfetch_mcp you can inject that header automatically for every request, or only for specific domains:
+
+```yaml
+# Global — every request negotiates Markdown
+global:
+  headers:
+    Accept: "text/markdown"
+
+# Or per-domain — only for sites you know support it
+domains:
+  docs.example.com:
+    headers:
+      Accept: "text/markdown"
+    output_format: raw          # Cloudflare already returns Markdown; skip local conversion
+```
+
+Cloudflare's response includes useful extra headers:
+
+| Header | Description |
+|--------|-------------|
+| `x-markdown-tokens` | Estimated token count of the Markdown document — useful for context-window budgeting |
+| `Content-Signal` | AI usage permissions (e.g. `ai-train=yes, search=yes, ai-input=yes`) |
+
+Sites that don't support the feature simply ignore the header and return normal HTML, so it is safe to set globally. You can verify support with a quick curl:
+
+```bash
+curl -sI https://example.com -H "Accept: text/markdown" | grep -i content-type
+# text/markdown → supported; text/html → not supported
 ```
 
 ---
