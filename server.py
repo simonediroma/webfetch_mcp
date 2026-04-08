@@ -826,7 +826,7 @@ def _apply_lighthtml(html: str) -> str:
 
         # Remove <script> blocks except JSON-LD
         for tag in soup.find_all("script"):
-            if tag.get("type", "").lower() != "application/ld+json":
+            if str(tag.get("type", "")).lower() != "application/ld+json":
                 tag.decompose()
 
         # Remove HTML comments
