@@ -48,6 +48,114 @@ This server is a drop-in replacement: it exposes the same `fetch` tool to any MC
 
 ---
 
+## Windows installation (no admin required)
+
+This guide installs everything under your user profile — no administrator rights needed at any step.
+
+### Step 1 — Install uv
+
+Open **PowerShell** and run:
+
+```powershell
+powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | iex"
+```
+
+Close and reopen PowerShell so `uv` is on your PATH.
+
+### Step 2 — Install Python 3.12 via uv
+
+```powershell
+$env:UV_PYTHON_INSTALL_DIR="C:\Users\$env:USERNAME\Documents\uv-python"
+uv python install 3.12
+```
+
+Find the exact path of the installed executable (you'll need it in step 4):
+
+```powershell
+uv python find 3.12
+```
+
+It will print something like:
+```
+C:\Users\username\Documents\uv-python\cpython-3.12.9-windows-x86_64-none\python.exe
+```
+
+### Step 3 — Download the repo
+
+**Option A — with git:**
+
+```powershell
+cd C:\Users\$env:USERNAME\Desktop
+git clone https://github.com/simonediroma/webfetch_mcp.git
+cd webfetch_mcp
+```
+
+**Option B — without git:**
+
+Download the ZIP from GitHub (Code → Download ZIP), extract it, and open that folder in PowerShell.
+
+### Step 4 — Create the virtual environment
+
+Replace `<python-path>` with the path printed in step 2:
+
+```powershell
+<python-path> -m venv .venv
+```
+
+Example:
+
+```powershell
+C:\Users\username\Documents\uv-python\cpython-3.12.9-windows-x86_64-none\python.exe -m venv .venv
+```
+
+### Step 5 — Install dependencies
+
+```powershell
+.venv\Scripts\pip install -r requirements.txt
+```
+
+### Step 6 — Create the config file
+
+```powershell
+copy webfetch.yaml.example webfetch.yaml
+```
+
+Open `webfetch.yaml` in Notepad and add any domain-specific headers or options you need (or leave the defaults for now).
+
+### Step 7 — Verify the server starts
+
+```powershell
+.venv\Scripts\python.exe server.py
+```
+
+You should see no errors. Press `Ctrl+C` to stop it.
+
+### Step 8 — Register with Claude Desktop
+
+Open `%APPDATA%\Claude\claude_desktop_config.json` in Notepad (create it if it doesn't exist) and add:
+
+```json
+{
+  "mcpServers": {
+    "webfetch": {
+      "command": "C:\\Users\\username\\Desktop\\webfetch_mcp\\.venv\\Scripts\\python.exe",
+      "args": ["C:\\Users\\username\\Desktop\\webfetch_mcp\\server.py"],
+      "env": {
+        "WEBFETCH_CONFIG": "C:\\Users\\username\\Desktop\\webfetch_mcp\\webfetch.yaml"
+      }
+    }
+  }
+}
+```
+
+Replace `username` with your Windows username and adjust the path if you cloned the repo elsewhere.
+
+> All backslashes must be doubled (`\\`) inside a JSON string.
+
+Restart Claude Desktop. Open a new conversation and ask Claude to fetch any URL — it will use `mcp__webfetch__fetch` automatically.
+
+---
+
 ## Quick start
 
 ```bash
