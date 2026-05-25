@@ -244,23 +244,44 @@ Add to `~/.cursor/mcp.json` (or the project-level `.cursor/mcp.json`):
 
 ### Claude Desktop (Mac / Windows)
 
-Add to `~/Library/Application Support/Claude/claude_desktop_config.json` on Mac, or `%APPDATA%\Claude\claude_desktop_config.json` on Windows:
+Add to `~/Library/Application Support/Claude/claude_desktop_config.json` on Mac, or `%APPDATA%\Claude\claude_desktop_config.json` on Windows.
+
+**Mac / Linux:**
 
 ```json
 {
   "mcpServers": {
     "webfetch": {
-      "command": "/absolute/path/to/.venv/bin/python",
-      "args": ["/absolute/path/to/server.py"],
+      "command": "/absolute/path/to/webfetch_mcp/.venv/bin/python",
+      "args": ["/absolute/path/to/webfetch_mcp/server.py"],
       "env": {
-        "WEBFETCH_CONFIG": "/absolute/path/to/webfetch.yaml"
+        "WEBFETCH_CONFIG": "/absolute/path/to/webfetch_mcp/webfetch.yaml"
       }
     }
   }
 }
 ```
 
-> **Windows:** use `.venv\Scripts\python.exe` as the `command` value.
+**Windows:**
+
+```json
+{
+  "mcpServers": {
+    "webfetch": {
+      "command": "C:\\Users\\username\\Desktop\\webfetch_mcp\\.venv\\Scripts\\python.exe",
+      "args": ["C:\\Users\\username\\Desktop\\webfetch_mcp\\server.py"],
+      "env": {
+        "WEBFETCH_CONFIG": "C:\\Users\\username\\Desktop\\webfetch_mcp\\webfetch.yaml"
+      }
+    }
+  }
+}
+```
+
+> Replace `C:\\Users\\username\\Desktop\\webfetch_mcp` with the actual folder where you cloned the repo.
+> All three paths (`python.exe`, `server.py`, `webfetch.yaml`) must point to the same folder.
+>
+> **Do not use `uv run` as the command** — point directly to the `.venv\Scripts\python.exe` executable created during setup.
 
 ### Other assistants (Continue, Zed, etc.)
 
