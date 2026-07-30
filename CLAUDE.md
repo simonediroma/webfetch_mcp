@@ -214,7 +214,7 @@ Features available exclusively via YAML (not accessible through env vars):
 
 | Package | Purpose |
 |---------|---------|
-| `mcp[cli]` | MCP server framework (FastMCP) |
+| `mcp[cli]` | MCP server framework (`MCPServer`, formerly `FastMCP`; renamed in SDK 2.0.0) |
 | `httpx` | Async HTTP client |
 | `python-dotenv` | Load `.env` at startup |
 | `markdownify` | HTML → Markdown conversion for `"markdown"` output format |
