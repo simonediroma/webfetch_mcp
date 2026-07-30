@@ -22,11 +22,11 @@ from urllib.parse import urlparse
 
 import httpx
 from dotenv import load_dotenv
-from mcp.server.fastmcp import FastMCP
+from mcp.server.mcpserver import MCPServer
 
 load_dotenv(Path(__file__).parent / ".env")
 
-mcp = FastMCP("webfetch")
+mcp = MCPServer("webfetch")
 _log = logging.getLogger(__name__)
 
 # Dedicated audit logger.  Enabled by setting WEBFETCH_AUDIT_LOG=1 at startup.
