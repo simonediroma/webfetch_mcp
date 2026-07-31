@@ -38,6 +38,7 @@ This server is a drop-in replacement: it exposes the same `fetch` tool to any MC
 | **Detailed response summary** | Every response includes a structured summary (status, elapsed ms, injected headers, format, etc.) |
 | **JS rendering (Playwright)** | Render JavaScript-heavy SPAs with headless Chromium before extracting content; configurable globally, per-domain, or per-call |
 | **lighthtml output format** | Strips `<style>`, `<script>` (except JSON-LD), comments, and all tag attributes — returns minimal bare HTML structure |
+| **TLS fingerprint impersonation (curl-cffi)** | Reproduce a real browser's TLS ClientHello/JA3 and HTTP/2 fingerprint, to bypass CDN bot detection that fingerprints below the header level; configurable globally, per-domain, or per-call |
 
 ---
 
@@ -138,6 +139,8 @@ global:
   bot_block_detection: false  # false | "report" | "retry"
   css_selector: null       # CSS selector to extract element(s) before format conversion
   render_js: false           # true = render JS via headless Chromium (requires playwright)
+  impersonate: null          # e.g. "chrome131" = impersonate a browser's TLS/HTTP2 fingerprint
+                              # (requires curl-cffi); loses to render_js when both are set
 
 # Per-domain overrides — only the fields you list are overridden
 domains:
@@ -166,6 +169,10 @@ domains:
     retry:
       attempts: 5
       backoff: 1.5
+
+  fingerprinted-cdn.com:
+    impersonate: chrome131   # bypasses TLS/JA3-fingerprint bot detection
+    output_format: trafilatura
 ```
 
 Domain matching uses **suffix rules**: `example.com` matches both `example.com` and `www.example.com`. When multiple domains match, the most specific (longest) key wins. Global settings are always applied first, then overridden by increasingly specific domain rules.
@@ -361,6 +368,7 @@ All parameters are optional except `url`.
 | `assert_status` | `int \| None` | `None` | Raise an error if the response status code does not match this value |
 | `assert_contains` | `str \| None` | `None` | Raise an error if this string is not found in the response body (case-sensitive) |
 | `render_js` | `bool \| None` | `None` | Render the page with headless Chromium (executes JS, waits for network idle). Requires `playwright`. |
+| `impersonate` | `str \| None` | `None` | Impersonate a browser's TLS/HTTP2 fingerprint (e.g. `"chrome131"`) to bypass CDN fingerprint-based bot detection. Requires `curl-cffi`. Ignored when `render_js` is effectively true. |
 
 ### Response format
 
@@ -377,6 +385,7 @@ Response size:    42381 bytes
 Output format:    trafilatura
 Text extracted:   no
 JS rendering:     no
+Impersonate:      no
 Truncated:        no
 Timeout:          60.0s
 Proxy:            none
@@ -471,6 +480,21 @@ domains:
 ```
 
 In `report` mode, the summary block flags the block without retrying. In `retry` mode, the server automatically issues a second request with a realistic Chrome User-Agent.
+
+---
+
+### Bypass TLS-fingerprint-based CDN blocking (JA3 detection)
+
+Some CDNs fingerprint the TLS handshake itself (cipher suite order, extensions, HTTP/2 frame ordering — JA3/JA4), not just the `User-Agent` header. A spoofed header doesn't help there, because plain `httpx`/Python TLS still looks like Python. `impersonate` routes the request through `curl-cffi`, which reproduces a real browser's TLS/HTTP2 signature byte-for-byte:
+
+```yaml
+domains:
+  fingerprinted-cdn.com:
+    impersonate: chrome131   # requires: pip install curl-cffi
+    output_format: trafilatura
+```
+
+This is a lighter-weight alternative to `render_js` for sites that block on fingerprint alone and don't require JavaScript execution — if a domain needs both (a JS challenge *and* fingerprint matching), use `render_js: true` instead, which wins automatically when both are configured on the same domain.
 
 ---
 

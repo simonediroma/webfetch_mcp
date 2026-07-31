@@ -91,6 +91,34 @@ global:
   #
   # render_js: false
 
+  # Browser TLS/HTTP2 fingerprint impersonation — bypasses CDN bot-detection
+  # that fingerprints at the TLS ClientHello / JA3 layer (not just the
+  # User-Agent header), which plain httpx cannot spoof. Uses curl-cffi
+  # (bundled libcurl-impersonate) to reproduce a real browser's TLS
+  # handshake and HTTP/2 frame ordering.
+  #
+  # Values are curl-cffi's impersonation target strings, e.g. "chrome131",
+  # "chrome124", "safari17_0", "firefox133" — see curl-cffi's documentation
+  # for the full, version-dependent list. Not validated against a fixed
+  # list here; an invalid value fails at request time with curl-cffi's
+  # own error.
+  #
+  # Precedence: if render_js is also true for a domain, render_js WINS —
+  # a real headless browser already produces a genuine TLS fingerprint as
+  # a side effect of being a real browser, so impersonate is a no-op then.
+  #
+  # Limitations under impersonate:
+  #   - tls_ca_bundle is NOT supported (curl-cffi only accepts a verify
+  #     bool, no custom CA path) — it is ignored with a logged warning.
+  #   - tls_min_version is NOT honored — the impersonation profile pins
+  #     the TLS version/cipher suite to match the impersonated browser.
+  #   - trace_redirects cannot show a full per-hop chain — curl-cffi does
+  #     not expose complete redirect history the way httpx does.
+  #
+  # Requires: pip install curl-cffi
+  #
+  # impersonate: null
+
 # ---------------------------------------------------------------------------
 # Per-domain overrides
 # All fields are optional — only the fields present override the global value.
@@ -129,3 +157,9 @@ domains:
     render_js: true
     output_format: trafilatura
     timeout: 60
+
+  # A CDN that TLS-fingerprints and blocks plain httpx requests even with a
+  # spoofed User-Agent header
+  fingerprinted.example.com:
+    impersonate: chrome131
+    output_format: trafilatura

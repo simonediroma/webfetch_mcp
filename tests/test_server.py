@@ -59,6 +59,27 @@ def _make_async_client_mock(response):
     return async_cm, client_mock
 
 
+def _make_curl_response(status_code=200, text="<html>hello</html>", content_type="text/html",
+                         reason=None, history=None):
+    """Mimic a curl_cffi.requests.Response for the impersonate fetch path."""
+    response = MagicMock()
+    response.status_code = status_code
+    response.text = text
+    response.reason = reason if reason is not None else ("OK" if status_code < 400 else "Error")
+    response.headers = {"content-type": content_type}
+    response.history = history or []
+    return response
+
+
+def _make_async_curl_session_mock(response):
+    session_mock = AsyncMock()
+    session_mock.request = AsyncMock(return_value=response)
+    async_cm = MagicMock()
+    async_cm.__aenter__ = AsyncMock(return_value=session_mock)
+    async_cm.__aexit__ = AsyncMock(return_value=False)
+    return async_cm, session_mock
+
+
 # ---------------------------------------------------------------------------
 # _load_config / env backward compat
 # ---------------------------------------------------------------------------
@@ -147,6 +168,25 @@ class TestLoadConfigYaml:
         assert srv._CONFIG["global"]["proxy"] == "http://proxy:8080"
         assert srv._CONFIG["domains"]["example.com"]["headers"] == {"x-token": "abc"}
         assert srv._CONFIG["domains"]["example.com"]["output_format"] == "trafilatura"
+
+    def test_impersonate_field_global_and_domain(self, monkeypatch, tmp_path):
+        yaml_file = tmp_path / "webfetch.yaml"
+        yaml_file.write_text(textwrap.dedent("""\
+            global:
+              impersonate: chrome124
+            domains:
+              example.com:
+                impersonate: chrome131
+        """))
+        srv = _reload_server(monkeypatch, config_path=str(yaml_file))
+        assert srv._CONFIG["global"]["impersonate"] == "chrome124"
+        assert srv._CONFIG["domains"]["example.com"]["impersonate"] == "chrome131"
+
+    def test_impersonate_defaults_to_none(self, monkeypatch, tmp_path):
+        yaml_file = tmp_path / "webfetch.yaml"
+        yaml_file.write_text("{}\n")
+        srv = _reload_server(monkeypatch, config_path=str(yaml_file))
+        assert srv._CONFIG["global"]["impersonate"] is None
 
     def test_yaml_missing_file_raises(self, monkeypatch, tmp_path):
         monkeypatch.setenv("WEBFETCH_CONFIG", str(tmp_path / "nonexistent.yaml"))
@@ -373,6 +413,57 @@ class TestResolveRetry:
         result = self.server._resolve_retry("example.com")
         assert result["attempts"] == 5
         assert result["backoff"] == 2.0
+
+
+# ---------------------------------------------------------------------------
+# _resolve_impersonate
+# ---------------------------------------------------------------------------
+
+class TestResolveImpersonate:
+
+    @pytest.fixture(autouse=True)
+    def setup(self, monkeypatch):
+        import server
+        self.server = server
+        self.monkeypatch = monkeypatch
+
+    def _set_config(self, global_impersonate, domains=None):
+        self.monkeypatch.setattr(
+            self.server,
+            "_CONFIG",
+            {
+                "global": {**self.server._DEFAULT_GLOBAL, "impersonate": global_impersonate},
+                "domains": {k: v for k, v in (domains or {}).items()},
+            },
+        )
+
+    def test_global_default_none(self):
+        self._set_config(None)
+        assert self.server._resolve_impersonate("example.com", None) is None
+
+    def test_global_value(self):
+        self._set_config("chrome124")
+        assert self.server._resolve_impersonate("example.com", None) == "chrome124"
+
+    def test_domain_override(self):
+        self._set_config(None, {"example.com": {"impersonate": "chrome131"}})
+        assert self.server._resolve_impersonate("example.com", None) == "chrome131"
+
+    def test_subdomain_inherits_domain_value(self):
+        self._set_config(None, {"example.com": {"impersonate": "safari17_0"}})
+        assert self.server._resolve_impersonate("www.example.com", None) == "safari17_0"
+
+    def test_global_used_when_no_domain_match(self):
+        self._set_config("chrome124", {"other.com": {"impersonate": "chrome131"}})
+        assert self.server._resolve_impersonate("example.com", None) == "chrome124"
+
+    def test_per_call_overrides_domain_and_global(self):
+        self._set_config("chrome124", {"example.com": {"impersonate": "chrome131"}})
+        assert self.server._resolve_impersonate("example.com", "firefox133") == "firefox133"
+
+    def test_domain_more_specific_than_global(self):
+        self._set_config("chrome124", {"example.com": {"impersonate": "chrome131"}})
+        assert self.server._resolve_impersonate("example.com", None) == "chrome131"
 
 
 # ---------------------------------------------------------------------------
@@ -1229,6 +1320,160 @@ class TestFetchBotBlock:
         with patch("httpx.AsyncClient", return_value=async_cm):
             result = await self.server.fetch("http://example.com/")
         assert "Chrome retry:     no" in result
+
+
+# ---------------------------------------------------------------------------
+# impersonate (curl-cffi TLS/HTTP2 fingerprint impersonation)
+# ---------------------------------------------------------------------------
+
+class TestFetchImpersonate:
+    """Integration tests for the curl-cffi impersonate fetch path in fetch()."""
+
+    def setup_method(self):
+        import sys
+        sys.modules.pop("server", None)
+        import server
+        self.server = server
+
+    def _set_impersonate(self, value, domain=None):
+        cfg = {**self.server._DEFAULT_GLOBAL}
+        domains = {}
+        if domain is not None:
+            domains[domain] = {"impersonate": value}
+        else:
+            cfg["impersonate"] = value
+        self.server._CONFIG["global"] = cfg
+        self.server._CONFIG["domains"] = domains
+
+    async def test_impersonate_unset_uses_httpx_not_curl_cffi(self):
+        response = _make_mock_response(200, "hello")
+        async_cm, _ = _make_async_client_mock(response)
+        with patch("httpx.AsyncClient", return_value=async_cm) as httpx_cls, \
+             patch("curl_cffi.requests.AsyncSession") as curl_cls:
+            result = await self.server.fetch("http://example.com/")
+        httpx_cls.assert_called_once()
+        curl_cls.assert_not_called()
+        assert "Impersonate:      no" in result
+
+    async def test_impersonate_set_uses_curl_cffi_not_httpx(self):
+        self._set_impersonate("chrome131", domain="example.com")
+        response = _make_curl_response(200, "impersonated body")
+        async_cm, session_mock = _make_async_curl_session_mock(response)
+        with patch("curl_cffi.requests.AsyncSession", return_value=async_cm) as curl_cls, \
+             patch("httpx.AsyncClient") as httpx_cls:
+            result = await self.server.fetch("http://example.com/")
+        curl_cls.assert_called_once()
+        assert curl_cls.call_args.kwargs["impersonate"] == "chrome131"
+        httpx_cls.assert_not_called()
+        assert "impersonated body" in result
+        assert "Impersonate:      chrome131" in result
+
+    async def test_per_call_impersonate_overrides_config(self):
+        response = _make_curl_response(200, "body")
+        async_cm, _ = _make_async_curl_session_mock(response)
+        with patch("curl_cffi.requests.AsyncSession", return_value=async_cm) as curl_cls:
+            result = await self.server.fetch("http://example.com/", impersonate="safari17_0")
+        assert curl_cls.call_args.kwargs["impersonate"] == "safari17_0"
+        assert "Impersonate:      safari17_0" in result
+
+    async def test_render_js_wins_over_impersonate_on_same_domain(self):
+        self.server._CONFIG["global"] = {
+            **self.server._DEFAULT_GLOBAL,
+            "impersonate": "chrome131",
+            "render_js": True,
+        }
+        self.server._CONFIG["domains"] = {}
+        with patch.object(
+            self.server, "_fetch_with_browser",
+            AsyncMock(return_value=("<html>rendered</html>", 200)),
+        ) as browser_mock, patch("curl_cffi.requests.AsyncSession") as curl_cls:
+            result = await self.server.fetch("http://example.com/")
+        browser_mock.assert_called_once()
+        curl_cls.assert_not_called()
+        assert "rendered" in result
+
+    async def test_retries_on_500_through_curl_cffi(self):
+        self._set_impersonate("chrome131")
+        self.server._CONFIG["global"]["retry"] = {"attempts": 3, "backoff": 2.0}
+        bad = _make_curl_response(500, "error")
+        good = _make_curl_response(200, "ok")
+        session_mock = AsyncMock()
+        session_mock.request = AsyncMock(side_effect=[bad, bad, good])
+        async_cm = MagicMock()
+        async_cm.__aenter__ = AsyncMock(return_value=session_mock)
+        async_cm.__aexit__ = AsyncMock(return_value=False)
+
+        with patch("curl_cffi.requests.AsyncSession", return_value=async_cm), \
+             patch("asyncio.sleep", new_callable=AsyncMock):
+            result = await self.server.fetch("http://example.com/")
+        assert "200 OK" in result
+        assert session_mock.request.call_count == 3
+
+    async def test_reraises_after_all_attempts_exhausted(self):
+        from curl_cffi.requests.exceptions import RequestException
+        self._set_impersonate("chrome131")
+        self.server._CONFIG["global"]["retry"] = {"attempts": 2, "backoff": 2.0}
+        session_mock = AsyncMock()
+        session_mock.request = AsyncMock(side_effect=RequestException("connection refused"))
+        async_cm = MagicMock()
+        async_cm.__aenter__ = AsyncMock(return_value=session_mock)
+        async_cm.__aexit__ = AsyncMock(return_value=False)
+
+        with patch("curl_cffi.requests.AsyncSession", return_value=async_cm), \
+             patch("asyncio.sleep", new_callable=AsyncMock):
+            with pytest.raises(RequestException):
+                await self.server.fetch("http://example.com/")
+        assert session_mock.request.call_count == 2
+
+    async def test_bot_block_report_mode_via_curl_cffi(self):
+        self._set_impersonate("chrome131")
+        self.server._CONFIG["global"]["bot_block_detection"] = "report"
+        response = _make_curl_response(403, "<html>Access Denied cloudflare</html>")
+        async_cm, _ = _make_async_curl_session_mock(response)
+        with patch("curl_cffi.requests.AsyncSession", return_value=async_cm):
+            result = await self.server.fetch("http://example.com/")
+        assert "Bot block:" in result
+        assert "HTTP 403" in result
+
+    async def test_bot_block_retry_mode_does_not_fall_back_to_httpx(self):
+        self._set_impersonate("chrome131")
+        self.server._CONFIG["global"]["bot_block_detection"] = "retry"
+        response = _make_curl_response(403, "<html>cloudflare block</html>")
+        async_cm, _ = _make_async_curl_session_mock(response)
+        with patch("curl_cffi.requests.AsyncSession", return_value=async_cm), \
+             patch("httpx.AsyncClient") as httpx_cls:
+            result = await self.server.fetch("http://example.com/")
+        httpx_cls.assert_not_called()
+        assert "Bot block:" in result
+
+    async def test_curl_cffi_not_installed_raises_runtime_error(self, monkeypatch):
+        self._set_impersonate("chrome131")
+        monkeypatch.setitem(sys.modules, "curl_cffi.requests", None)
+        with pytest.raises(RuntimeError, match="curl-cffi is required"):
+            await self.server.fetch("http://example.com/")
+
+    async def test_trace_redirects_does_not_crash_under_impersonate(self):
+        self._set_impersonate("chrome131")
+        response = _make_curl_response(200, "ok", history=[{"status_code": 301}])
+        async_cm, _ = _make_async_curl_session_mock(response)
+        with patch("curl_cffi.requests.AsyncSession", return_value=async_cm):
+            result = await self.server.fetch("http://example.com/", trace_redirects=True)
+        assert "Redirect chain:" in result
+
+    async def test_audit_event_includes_impersonate(self):
+        self._set_impersonate("chrome131")
+        monkeypatch_attr = self.server._AUDIT_ENABLED
+        self.server._AUDIT_ENABLED = True
+        try:
+            response = _make_curl_response(200, "ok")
+            async_cm, _ = _make_async_curl_session_mock(response)
+            emitted = []
+            with patch.object(self.server, "_emit_audit_event", side_effect=emitted.append), \
+                 patch("curl_cffi.requests.AsyncSession", return_value=async_cm):
+                await self.server.fetch("http://example.com/")
+            assert emitted[0]["impersonate"] == "chrome131"
+        finally:
+            self.server._AUDIT_ENABLED = monkeypatch_attr
 
 
 # ---------------------------------------------------------------------------

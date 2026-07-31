@@ -147,6 +147,7 @@ _DEFAULT_GLOBAL: dict = {
     "tls_ca_bundle": None,
     "tls_min_version": None,
     "render_js": False,
+    "impersonate": None,
 }
 
 # ---------------------------------------------------------------------------
@@ -431,6 +432,15 @@ def _merge_domain_section(target: dict, source: dict, *, context: str) -> None:
                 f"'{context}.render_js' must be a boolean, got {type(val).__name__!r}"
             )
         target["render_js"] = val
+
+    if "impersonate" in source:
+        val = source["impersonate"]
+        # Not validated against a fixed set of browser targets: curl-cffi's
+        # supported impersonation targets (e.g. "chrome131", "safari17_0")
+        # change across releases, so an unrecognised value is left to fail
+        # naturally at request time via curl-cffi's own error — same
+        # treatment as "proxy" and "tls_ca_bundle" above.
+        target["impersonate"] = str(val) if val is not None else None
 
     if "css_selector" in source:
         val = source["css_selector"]
@@ -758,6 +768,35 @@ def _resolve_render_js(hostname: str, per_call: bool | None) -> bool:
     return bool(val)
 
 
+def _resolve_impersonate(hostname: str, per_call: str | None) -> str | None:
+    """Return the effective curl-cffi impersonation target for *hostname*, or None.
+
+    Precedence (later wins):
+      1. Global config impersonate
+      2. Most-specific matching domain impersonate
+      3. per_call (None = don't override)
+    """
+    val: str | None = _CONFIG["global"].get("impersonate")
+    for key in _matching_domain_keys(hostname, _CONFIG["domains"]):
+        domain = _CONFIG["domains"][key]
+        if "impersonate" in domain:
+            val = domain["impersonate"]
+    if per_call is not None:
+        val = per_call
+    return val
+
+
+def _build_curl_cffi_verify(tls_verify: bool, tls_ca_bundle: str | None) -> bool:
+    """Return the curl-cffi ``verify`` kwarg for the given TLS settings.
+
+    curl-cffi's Session API only accepts a bool for ``verify`` — unlike
+    httpx, there is no kwarg to point it at a custom CA bundle path. If
+    tls_ca_bundle is set, it is silently unusable here; the caller is
+    expected to log a warning so this isn't a silent behaviour gap.
+    """
+    return bool(tls_verify)
+
+
 # ---------------------------------------------------------------------------
 # Output formatting
 # ---------------------------------------------------------------------------
@@ -1066,6 +1105,7 @@ async def fetch(
     assert_status: int | None = None,
     assert_contains: str | None = None,
     render_js: bool | None = None,
+    impersonate: str | None = None,
 ) -> str:
     """
     Fetch a URL and return its response, injecting domain-scoped authentication
@@ -1112,6 +1152,15 @@ async def fetch(
                           Overrides the domain-scoped render_js config for this
                           request only.  Default: None (use config, which defaults
                           to False — plain HTTP via httpx).
+        impersonate:      Impersonate a real browser's TLS/HTTP2 fingerprint (e.g.
+                          "chrome131", "safari17_0") to bypass CDN bot-detection
+                          that fingerprints at the TLS ClientHello layer, not just
+                          the User-Agent header (which plain httpx cannot spoof).
+                          Requires curl-cffi: pip install curl-cffi.
+                          Overrides the domain-scoped impersonate config for this
+                          request only.  Ignored when render_js is effectively
+                          True (a real headless browser already produces a
+                          genuine TLS fingerprint).  Default: None (use config).
     """
     parsed = urlparse(url)
     hostname = parsed.hostname or ""
@@ -1149,8 +1198,26 @@ async def fetch(
     ssl_context = _build_ssl_context(tls_ca_bundle, tls_min_version, tls_verify)
 
     effective_render_js = _resolve_render_js(hostname, render_js)
+    effective_impersonate = _resolve_impersonate(hostname, impersonate)
+    if effective_render_js and effective_impersonate:
+        # render_js wins: a real headless browser already produces a genuine
+        # TLS fingerprint as a side effect of being a real browser, so
+        # impersonate would be a no-op alongside it.
+        _log.info(
+            "render_js takes precedence over impersonate=%r for %s",
+            effective_impersonate, hostname,
+        )
 
-    # Shared variables populated by either fetch path
+    # Serialize dict/list bodies to JSON automatically (shared by the
+    # curl-cffi and httpx paths; render_js/Playwright is a GET-only
+    # navigation today and does not consume body).
+    if isinstance(body, (dict, list)):
+        import json
+        body = json.dumps(body)
+        if not any(k.lower() == "content-type" for k in headers):
+            headers["Content-Type"] = "application/json"
+
+    # Shared variables populated by any of the three fetch paths
     content: str
     raw_html: str
     response_size: int
@@ -1177,6 +1244,127 @@ async def fetch(
         actual_attempts = 1
         if status_code >= 400:
             _log.warning("fetch %s %s returned HTTP %s (browser)", method.upper(), url, status_code)
+    elif effective_impersonate:
+        # --- TLS/HTTP2 fingerprint impersonation fetch (curl-cffi) ---
+        try:
+            from curl_cffi.requests import AsyncSession
+            from curl_cffi.requests.exceptions import RequestException as CurlRequestException
+        except ImportError:
+            raise RuntimeError(
+                "curl-cffi is required for TLS-fingerprint impersonation but is not installed.\n"
+                "Install it with:\n"
+                "  pip install curl-cffi"
+            )
+
+        if tls_ca_bundle is not None:
+            _log.warning(
+                "tls_ca_bundle is not supported by curl-cffi (impersonate=%r); ignoring for %s",
+                effective_impersonate, hostname,
+            )
+        if tls_min_version is not None:
+            _log.warning(
+                "tls_min_version is not supported by curl-cffi (impersonate=%r); the "
+                "impersonation profile pins its own TLS parameters for %s",
+                effective_impersonate, hostname,
+            )
+        curl_verify = _build_curl_cffi_verify(tls_verify, tls_ca_bundle)
+
+        _log.info(
+            "fetch %s %s (impersonate=%r, timeout=%.1fs, attempts=%d)",
+            method.upper(), url, effective_impersonate, timeout, attempts,
+        )
+
+        session_kwargs: dict = {
+            "impersonate": effective_impersonate,
+            "timeout": timeout,
+            "verify": curl_verify,
+            "allow_redirects": follow_redirects,
+        }
+        if proxy:
+            session_kwargs["proxy"] = proxy
+
+        curl_response = None
+        delay = 1.0
+        actual_attempts = 0
+        request_start = time.monotonic()
+
+        async with AsyncSession(**session_kwargs) as session:
+            for attempt in range(attempts):
+                actual_attempts = attempt + 1
+                try:
+                    curl_response = await session.request(
+                        method=method.upper(),
+                        url=url,
+                        headers=headers,
+                        data=body.encode() if body else None,
+                    )
+                    if curl_response.status_code >= 500 and attempt < attempts - 1:
+                        _log.warning(
+                            "fetch attempt %d/%d returned HTTP %s; retrying in %.1fs",
+                            attempt + 1, attempts, curl_response.status_code, delay,
+                        )
+                        await asyncio.sleep(delay)
+                        delay *= backoff_mult
+                        continue
+                    break
+                except CurlRequestException as exc:
+                    if attempt < attempts - 1:
+                        _log.warning(
+                            "fetch attempt %d/%d failed (%s); retrying in %.1fs",
+                            attempt + 1, attempts, exc, delay,
+                        )
+                        await asyncio.sleep(delay)
+                        delay *= backoff_mult
+                    else:
+                        _log.error(
+                            "fetch %s %s failed after %d attempt(s): %s",
+                            method.upper(), url, attempts, exc,
+                        )
+                        raise
+
+        elapsed_ms = int((time.monotonic() - request_start) * 1000)
+
+        if curl_response is None:
+            # Should not happen, but satisfy type checker
+            raise RuntimeError("No response received")
+
+        if curl_response.status_code >= 400:
+            _log.warning(
+                "fetch %s %s returned HTTP %s (impersonate)",
+                method.upper(), url, curl_response.status_code,
+            )
+
+        content = curl_response.text
+        raw_html = content  # preserve original for metadata extraction and bot-block scanning
+        response_size = len(content)
+        status_code = curl_response.status_code
+        reason_phrase = curl_response.reason
+        content_type = curl_response.headers.get("content-type", "")
+
+        # --- Bot-block / paywall detection (report-only under impersonate) ---
+        bot_block_mode = _resolve_bot_block_detection(hostname)
+        if bot_block_mode and bot_block_mode in _VALID_BOT_BLOCK_MODES:
+            bot_block_reason = _detect_bot_block(
+                curl_response.status_code,
+                dict(curl_response.headers),
+                raw_html,
+            )
+            if bot_block_reason and bot_block_mode == "retry":
+                _log.warning(
+                    "bot_block_detection=retry has no effect under impersonate=%r "
+                    "(already impersonating a real browser's TLS fingerprint) for %s",
+                    effective_impersonate, hostname,
+                )
+
+        # --- Redirect chain ---
+        # curl-cffi's response.history only carries partial header info (no
+        # guaranteed per-hop status/URL), unlike httpx's full Response
+        # objects, so a faithful hop-by-hop trace isn't available here.
+        if trace_redirects and curl_response.history:
+            redirect_chain_str = (
+                f"  not available under impersonate ({len(curl_response.history)} hop(s); "
+                f"curl-cffi does not expose a full per-hop redirect trace)"
+            )
     else:
         # --- Plain HTTP fetch (httpx) ---
         client_kwargs: dict = {
@@ -1186,13 +1374,6 @@ async def fetch(
         }
         if proxy:
             client_kwargs["proxy"] = proxy
-
-        # Serialize dict/list bodies to JSON automatically
-        if isinstance(body, (dict, list)):
-            import json
-            body = json.dumps(body)
-            if not any(k.lower() == "content-type" for k in headers):
-                headers["Content-Type"] = "application/json"
 
         response = None
         delay = 1.0
@@ -1439,6 +1620,7 @@ async def fetch(
         f"Output format:    {effective_fmt}\n"
         f"Text extracted:   {'yes' if extract_text else 'no'}\n"
         f"JS rendering:     {'yes (playwright)' if effective_render_js else 'no'}\n"
+        f"Impersonate:      {effective_impersonate or 'no'}\n"
         f"Truncated:        {truncated_str}\n"
         f"Timeout:          {timeout}s\n"
         f"Proxy:            {proxy_str}\n"
@@ -1460,6 +1642,7 @@ async def fetch(
         "retry_attempt": actual_attempts,
         "bot_blocked": bot_block_reason,
         "render_js": effective_render_js,
+        "impersonate": effective_impersonate,
     })
     return f"{summary}\n\n{content}"
 
