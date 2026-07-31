@@ -190,7 +190,7 @@ When `WEBFETCH_CONFIG` is not set, only the three legacy env vars are read.
 Features available exclusively via YAML (not accessible through env vars):
 `timeout`, `retry`, `proxy`, `bot_block_detection`, `sanitize_content`,
 `extract_metadata`, `tls_verify`, `tls_ca_bundle`, `tls_min_version`,
-`allowed_domains`, `denied_domains`.
+`allowed_domains`, `denied_domains`, `impersonate`.
 
 ---
 
