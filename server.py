@@ -148,7 +148,24 @@ _DEFAULT_GLOBAL: dict = {
     "tls_min_version": None,
     "render_js": False,
     "impersonate": None,
+    "response_headers": False,
 }
+
+# Response headers whose values are never echoed back to the model: the name
+# is shown, the value is replaced with "[REDACTED]".  Not configurable.
+_SENSITIVE_RESPONSE_HEADERS = frozenset({
+    "set-cookie",
+    "authorization",
+    "proxy-authorization",
+    "www-authenticate",
+    "proxy-authenticate",
+    "x-api-key",
+    "x-auth-token",
+    "x-csrf-token",
+    "x-xsrf-token",
+})
+# Longer header values are truncated in the summary to keep it readable.
+_RESPONSE_HEADER_VALUE_MAX = 200
 
 # ---------------------------------------------------------------------------
 # Audit logging
@@ -285,6 +302,20 @@ def _validate_url(url: str, allowed_domains: list, denied_domains: list) -> None
 # ---------------------------------------------------------------------------
 # Config loading
 # ---------------------------------------------------------------------------
+
+def _normalise_response_headers_value(val, context: str) -> bool | list[str]:
+    """Validate a ``response_headers`` setting: ``false``, ``true`` or a list of names.
+
+    Header names are lower-cased so they match the normalised response headers.
+    """
+    if isinstance(val, bool):
+        return val
+    if isinstance(val, list) and all(isinstance(x, str) for x in val):
+        return [x.strip().lower() for x in val if x.strip()]
+    raise RuntimeError(
+        f"'{context}' is {val!r}; must be a boolean or a list of header names"
+    )
+
 
 def _load_config() -> dict:
     """
@@ -442,6 +473,11 @@ def _merge_domain_section(target: dict, source: dict, *, context: str) -> None:
         # treatment as "proxy" and "tls_ca_bundle" above.
         target["impersonate"] = str(val) if val is not None else None
 
+    if "response_headers" in source:
+        target["response_headers"] = _normalise_response_headers_value(
+            source["response_headers"], f"{context}.response_headers"
+        )
+
     if "css_selector" in source:
         val = source["css_selector"]
         target["css_selector"] = str(val) if val is not None else None
@@ -563,6 +599,21 @@ def _load_env_config() -> dict:
     raw_render_js = os.getenv("WEBFETCH_RENDER_JS", "").strip().lower()
     if raw_render_js in ("1", "true", "yes"):
         config["global"]["render_js"] = True
+
+    # --- WEBFETCH_RESPONSE_HEADERS ---
+    # "true" = show all response headers; "false" = none (default);
+    # otherwise a comma-separated list of header names to show.
+    raw_resp_headers = os.getenv("WEBFETCH_RESPONSE_HEADERS", "").strip()
+    if raw_resp_headers:
+        low = raw_resp_headers.lower()
+        if low in ("1", "true", "yes"):
+            config["global"]["response_headers"] = True
+        elif low in ("0", "false", "no"):
+            config["global"]["response_headers"] = False
+        else:
+            config["global"]["response_headers"] = _normalise_response_headers_value(
+                [h for h in raw_resp_headers.split(",")], "WEBFETCH_RESPONSE_HEADERS"
+            )
 
     return config
 
@@ -784,6 +835,81 @@ def _resolve_impersonate(hostname: str, per_call: str | None) -> str | None:
     if per_call is not None:
         val = per_call
     return val
+
+
+def _resolve_response_headers(
+    hostname: str, per_call: bool | list[str] | None
+) -> bool | list[str]:
+    """Return the effective ``response_headers`` setting for *hostname*.
+
+    ``False`` = don't show response headers, ``True`` = show all, or a list of
+    lower-cased header names to show.
+
+    Precedence (later wins):
+      1. Global config response_headers
+      2. Most-specific matching domain response_headers
+      3. per_call (None = don't override)
+    """
+    val: bool | list[str] = _CONFIG["global"].get("response_headers", False)
+    for key in _matching_domain_keys(hostname, _CONFIG["domains"]):
+        domain = _CONFIG["domains"][key]
+        if "response_headers" in domain:
+            val = domain["response_headers"]
+    if per_call is not None:
+        val = _normalise_response_headers_value(per_call, "response_headers")
+    return val
+
+
+def _headers_to_dict(headers) -> dict[str, str]:
+    """Normalise a response-headers object into a ``{lower_name: value}`` dict.
+
+    Accepts httpx/curl-cffi ``Headers`` (uses ``multi_items()`` so repeated
+    headers such as ``Set-Cookie`` are joined with ``", "``), Playwright's
+    plain dict, or any mapping.
+    """
+    if not headers:
+        return {}
+    multi = getattr(headers, "multi_items", None)
+    items = multi() if callable(multi) else dict(headers).items()
+    out: dict[str, str] = {}
+    for name, value in items:
+        key = str(name).lower()
+        out[key] = f"{out[key]}, {value}" if key in out else str(value)
+    return out
+
+
+def _format_response_headers(
+    headers: dict[str, str],
+    selection: bool | list[str],
+    indent: str = "  ",
+) -> list[str]:
+    """Render response headers as ``name: value`` lines for the summary.
+
+    *selection* is ``True`` (all headers, sorted by name) or a list of
+    lower-cased names (shown in that order; absent ones marked
+    ``(not present)``).  Sensitive headers have their value replaced with
+    ``[REDACTED]``; long values are truncated.
+    """
+    if selection is True:
+        names = sorted(headers)
+    elif isinstance(selection, list):
+        names = selection
+    else:
+        return []
+
+    lines: list[str] = []
+    for name in names:
+        if name not in headers:
+            lines.append(f"{indent}{name}: (not present)")
+            continue
+        if name in _SENSITIVE_RESPONSE_HEADERS:
+            value = "[REDACTED]"
+        else:
+            value = headers[name]
+            if len(value) > _RESPONSE_HEADER_VALUE_MAX:
+                value = f"{value[:_RESPONSE_HEADER_VALUE_MAX]}... ({len(value)} chars)"
+        lines.append(f"{indent}{name}: {value}")
+    return lines
 
 
 def _build_curl_cffi_verify(tls_verify: bool, tls_ca_bundle: str | None) -> bool:
@@ -1041,12 +1167,13 @@ async def _fetch_with_browser(
     headers: dict[str, str],
     timeout: float,
     proxy: str | None,
-) -> tuple[str, int]:
-    """Render *url* with Playwright Chromium and return (html, status_code).
+) -> tuple[str, int, dict[str, str]]:
+    """Render *url* with Playwright Chromium and return (html, status_code, headers).
 
     Executes all JavaScript on the page and waits for network to be idle
-    before capturing the rendered HTML.  Falls back to status 200 when the
-    Playwright response object is unavailable.
+    before capturing the rendered HTML.  *headers* are the response headers
+    of the main document (lower-cased names).  Falls back to status 200 and
+    empty headers when the Playwright response object is unavailable.
 
     Raises RuntimeError (with install instructions) if playwright is not
     installed.
@@ -1079,11 +1206,16 @@ async def _fetch_with_browser(
                 wait_until="networkidle",
             )
             html = await page.content()
-            status = resp.status if resp is not None else 200
+            if resp is not None:
+                status = resp.status
+                resp_headers = await resp.all_headers()
+            else:
+                status = 200
+                resp_headers = {}
         finally:
             await browser.close()
 
-    return html, status
+    return html, status, resp_headers
 
 
 # ---------------------------------------------------------------------------
@@ -1106,6 +1238,7 @@ async def fetch(
     assert_contains: str | None = None,
     render_js: bool | None = None,
     impersonate: str | None = None,
+    response_headers: bool | list[str] | None = None,
 ) -> str:
     """
     Fetch a URL and return its response, injecting domain-scoped authentication
@@ -1161,6 +1294,15 @@ async def fetch(
                           request only.  Ignored when render_js is effectively
                           True (a real headless browser already produces a
                           genuine TLS fingerprint).  Default: None (use config).
+        response_headers: Show the HTTP response headers in the summary.
+                          True = all headers; a list of names (e.g.
+                          ["content-type", "cache-control", "x-robots-tag"])
+                          = only those.  Sensitive values (Set-Cookie,
+                          Authorization, ...) are always redacted.  With
+                          trace_redirects=True the same selection is shown
+                          for every redirect hop.  Overrides the domain-scoped
+                          response_headers config for this request only.
+                          Default: None (use config, which defaults to False).
     """
     parsed = urlparse(url)
     hostname = parsed.hostname or ""
@@ -1199,6 +1341,7 @@ async def fetch(
 
     effective_render_js = _resolve_render_js(hostname, render_js)
     effective_impersonate = _resolve_impersonate(hostname, impersonate)
+    effective_response_headers = _resolve_response_headers(hostname, response_headers)
     if effective_render_js and effective_impersonate:
         # render_js wins: a real headless browser already produces a genuine
         # TLS fingerprint as a side effect of being a real browser, so
@@ -1229,13 +1372,18 @@ async def fetch(
     bot_block_reason: str | None = None
     chrome_retry_attempted: bool = False
     redirect_chain_str: str | None = None
+    response_headers_raw: dict[str, str] = {}
+    redirect_hops: list[dict] | None = None
 
     if effective_render_js:
         # --- Headless browser fetch (Playwright) ---
         _log.info("fetch %s %s (render_js=True, timeout=%.1fs)", method.upper(), url, timeout)
         request_start = time.monotonic()
-        html, status_code = await _fetch_with_browser(url, headers, timeout, proxy)
+        html, status_code, browser_headers = await _fetch_with_browser(
+            url, headers, timeout, proxy
+        )
         elapsed_ms = int((time.monotonic() - request_start) * 1000)
+        response_headers_raw = _headers_to_dict(browser_headers)
         content = html
         raw_html = html
         response_size = len(html)
@@ -1340,6 +1488,7 @@ async def fetch(
         status_code = curl_response.status_code
         reason_phrase = curl_response.reason
         content_type = curl_response.headers.get("content-type", "")
+        response_headers_raw = _headers_to_dict(curl_response.headers)
 
         # --- Bot-block / paywall detection (report-only under impersonate) ---
         bot_block_mode = _resolve_bot_block_detection(hostname)
@@ -1429,6 +1578,7 @@ async def fetch(
         status_code = response.status_code
         reason_phrase = response.reason_phrase
         content_type = response.headers.get("content-type", "")
+        response_headers_raw = _headers_to_dict(response.headers)
 
         # --- Bot-block / paywall detection (Feature 3) ---
         bot_block_mode = _resolve_bot_block_detection(hostname)
@@ -1464,6 +1614,7 @@ async def fetch(
                             response_size = len(content)
                             status_code = chrome_resp.status_code
                             reason_phrase = chrome_resp.reason_phrase
+                            response_headers_raw = _headers_to_dict(chrome_resp.headers)
                             bot_block_reason = None
                         else:
                             _log.warning("Chrome UA retry also blocked: %s", chrome_block)
@@ -1471,13 +1622,24 @@ async def fetch(
                         _log.warning("Chrome UA retry failed: %s", exc)
 
         # --- Redirect chain ---
+        # Kept as structured hops so the summary can also show per-hop
+        # response headers when response_headers is enabled.
         if trace_redirects and response.history:
-            lines = [
-                f"  {r.status_code}  {r.url}  →  {r.headers.get('location', '?')}"
+            redirect_hops = [
+                {
+                    "status": r.status_code,
+                    "url": str(r.url),
+                    "location": r.headers.get("location", "?"),
+                    "headers": _headers_to_dict(r.headers),
+                }
                 for r in response.history
             ]
-            lines.append(f"  {response.status_code}  {response.url}  (final)")
-            redirect_chain_str = "\n".join(lines)
+            redirect_hops.append({
+                "status": response.status_code,
+                "url": str(response.url),
+                "location": None,
+                "headers": response_headers_raw,
+            })
 
     # Detect JSON from Content-Type when no explicit format is set
     effective_fmt: str
@@ -1599,11 +1761,32 @@ async def fetch(
         else:
             applied_str = "no match (full HTML used)"
         extra_lines += f"\nCSS selector:     {effective_selector!r} ({applied_str})"
+    if redirect_hops:
+        hop_lines: list[str] = []
+        for hop in redirect_hops:
+            if hop["location"] is None:
+                hop_lines.append(f"  {hop['status']}  {hop['url']}  (final)")
+            else:
+                hop_lines.append(f"  {hop['status']}  {hop['url']}  →  {hop['location']}")
+            if effective_response_headers:
+                hop_lines.extend(_format_response_headers(
+                    hop["headers"], effective_response_headers, indent="      "
+                ))
+        redirect_chain_str = "\n".join(hop_lines)
     if trace_redirects:
         if redirect_chain_str:
             extra_lines += f"\nRedirect chain:\n{redirect_chain_str}"
         else:
             extra_lines += "\nRedirect chain:   none (no redirects)"
+    response_header_lines: list[str] = []
+    if effective_response_headers:
+        response_header_lines = _format_response_headers(
+            response_headers_raw, effective_response_headers
+        )
+        if response_header_lines:
+            extra_lines += "\nResponse headers:\n" + "\n".join(response_header_lines)
+        else:
+            extra_lines += "\nResponse headers: none"
     if assert_status is not None:
         extra_lines += f"\nassert_status:    {assert_status} (passed)"
     if assert_contains is not None:
@@ -1643,6 +1826,7 @@ async def fetch(
         "bot_blocked": bot_block_reason,
         "render_js": effective_render_js,
         "impersonate": effective_impersonate,
+        "response_headers_shown": len(response_header_lines),
     })
     return f"{summary}\n\n{content}"
 

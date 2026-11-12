@@ -1385,7 +1385,7 @@ class TestFetchImpersonate:
         self.server._CONFIG["domains"] = {}
         with patch.object(
             self.server, "_fetch_with_browser",
-            AsyncMock(return_value=("<html>rendered</html>", 200)),
+            AsyncMock(return_value=("<html>rendered</html>", 200, {})),
         ) as browser_mock, patch("curl_cffi.requests.AsyncSession") as curl_cls:
             result = await self.server.fetch("http://example.com/")
         browser_mock.assert_called_once()
@@ -2011,3 +2011,305 @@ class TestCssSelectorWithOutputFormat:
         assert "Output format:    markdown" in result
         # Markdown heading must be present in the body
         assert "Title" in result
+
+
+# ---------------------------------------------------------------------------
+# response_headers — config, resolver, formatter
+# ---------------------------------------------------------------------------
+
+class TestResponseHeadersConfig:
+
+    def _yaml(self, tmp_path, text):
+        f = tmp_path / "webfetch.yaml"
+        f.write_text(textwrap.dedent(text))
+        return str(f)
+
+    def test_defaults_to_false(self, monkeypatch, tmp_path):
+        srv = _reload_server(monkeypatch, config_path=self._yaml(tmp_path, "global: {}\n"))
+        assert srv._CONFIG["global"]["response_headers"] is False
+
+    def test_yaml_bool_and_list(self, monkeypatch, tmp_path):
+        srv = _reload_server(monkeypatch, config_path=self._yaml(tmp_path, """
+            global:
+              response_headers: true
+            domains:
+              example.com:
+                response_headers: [Content-Type, " X-Robots-Tag "]
+        """))
+        assert srv._CONFIG["global"]["response_headers"] is True
+        assert srv._CONFIG["domains"]["example.com"]["response_headers"] == [
+            "content-type", "x-robots-tag"
+        ]
+
+    def test_yaml_invalid_value_rejected(self, monkeypatch, tmp_path):
+        path = self._yaml(tmp_path, "global:\n  response_headers: sometimes\n")
+        with pytest.raises(SystemExit):
+            _reload_server(monkeypatch, config_path=path)
+
+    def test_env_true(self, monkeypatch):
+        monkeypatch.setenv("WEBFETCH_RESPONSE_HEADERS", "true")
+        srv = _reload_server(monkeypatch)
+        assert srv._CONFIG["global"]["response_headers"] is True
+
+    def test_env_list(self, monkeypatch):
+        monkeypatch.setenv("WEBFETCH_RESPONSE_HEADERS", "Content-Type, cache-control")
+        srv = _reload_server(monkeypatch)
+        assert srv._CONFIG["global"]["response_headers"] == ["content-type", "cache-control"]
+
+    def test_env_absent_keeps_default(self, monkeypatch):
+        monkeypatch.delenv("WEBFETCH_RESPONSE_HEADERS", raising=False)
+        srv = _reload_server(monkeypatch)
+        assert srv._resolve_response_headers("example.com", None) is False
+
+
+class TestResolveResponseHeaders:
+
+    @pytest.fixture(autouse=True)
+    def setup(self, monkeypatch):
+        import server
+        self.server = server
+        self.monkeypatch = monkeypatch
+
+    def _set_config(self, global_value, domains=None):
+        self.monkeypatch.setattr(
+            self.server,
+            "_CONFIG",
+            {
+                "global": {**self.server._DEFAULT_GLOBAL, "response_headers": global_value},
+                "domains": dict(domains or {}),
+            },
+        )
+
+    def test_global_default_false(self):
+        self._set_config(False)
+        assert self.server._resolve_response_headers("example.com", None) is False
+
+    def test_global_true(self):
+        self._set_config(True)
+        assert self.server._resolve_response_headers("example.com", None) is True
+
+    def test_domain_override_list(self):
+        self._set_config(False, {"example.com": {"response_headers": ["content-type"]}})
+        assert self.server._resolve_response_headers("example.com", None) == ["content-type"]
+
+    def test_subdomain_inherits_domain_value(self):
+        self._set_config(False, {"example.com": {"response_headers": True}})
+        assert self.server._resolve_response_headers("www.example.com", None) is True
+
+    def test_domain_can_disable_global(self):
+        self._set_config(True, {"example.com": {"response_headers": False}})
+        assert self.server._resolve_response_headers("example.com", None) is False
+
+    def test_per_call_bool_overrides(self):
+        self._set_config(False, {"example.com": {"response_headers": ["x"]}})
+        assert self.server._resolve_response_headers("example.com", True) is True
+
+    def test_per_call_list_is_lowercased(self):
+        self._set_config(True)
+        assert self.server._resolve_response_headers("example.com", ["Cache-Control"]) == [
+            "cache-control"
+        ]
+
+    def test_per_call_invalid_raises(self):
+        self._set_config(False)
+        with pytest.raises(RuntimeError):
+            self.server._resolve_response_headers("example.com", "content-type")
+
+
+class TestFormatResponseHeaders:
+
+    @pytest.fixture(autouse=True)
+    def setup(self):
+        import server
+        self.server = server
+
+    def test_all_sorted_and_redacted(self):
+        lines = self.server._format_response_headers(
+            {"set-cookie": "sid=secret", "content-type": "text/html", "etag": '"abc"'},
+            True,
+        )
+        assert lines == [
+            "  content-type: text/html",
+            '  etag: "abc"',
+            "  set-cookie: [REDACTED]",
+        ]
+
+    def test_selection_keeps_order_and_marks_absent(self):
+        lines = self.server._format_response_headers(
+            {"content-type": "text/html"},
+            ["x-robots-tag", "content-type"],
+        )
+        assert lines == [
+            "  x-robots-tag: (not present)",
+            "  content-type: text/html",
+        ]
+
+    def test_long_value_truncated(self):
+        value = "a" * 500
+        lines = self.server._format_response_headers({"link": value}, True)
+        assert lines[0].startswith("  link: " + "a" * 200 + "...")
+        assert "(500 chars)" in lines[0]
+
+    def test_false_selection_returns_nothing(self):
+        assert self.server._format_response_headers({"a": "b"}, False) == []
+
+    def test_custom_indent(self):
+        lines = self.server._format_response_headers({"a": "b"}, True, indent="      ")
+        assert lines == ["      a: b"]
+
+    def test_headers_to_dict_joins_multi_items(self):
+        class _Headers:
+            def multi_items(self):
+                return [("Set-Cookie", "a=1"), ("Set-Cookie", "b=2"), ("ETag", "x")]
+        assert self.server._headers_to_dict(_Headers()) == {
+            "set-cookie": "a=1, b=2", "etag": "x"
+        }
+
+    def test_headers_to_dict_plain_mapping(self):
+        assert self.server._headers_to_dict({"Content-Type": "x"}) == {"content-type": "x"}
+        assert self.server._headers_to_dict(None) == {}
+
+
+# ---------------------------------------------------------------------------
+# response_headers — fetch integration (httpx, curl-cffi, playwright, redirects)
+# ---------------------------------------------------------------------------
+
+class TestFetchResponseHeaders:
+
+    @pytest.fixture(autouse=True)
+    def _server(self, monkeypatch):
+        self.server = _reload_server(monkeypatch)
+
+    def _enable(self, value):
+        self.server._CONFIG["global"] = {**self.server._DEFAULT_GLOBAL, "response_headers": value}
+        self.server._CONFIG["domains"] = {}
+
+    async def test_disabled_by_default(self):
+        response = _make_mock_response(200, "<html>ok</html>")
+        async_cm, _ = _make_async_client_mock(response)
+        with patch("httpx.AsyncClient", return_value=async_cm):
+            result = await self.server.fetch("http://example.com/")
+        assert "Response headers" not in result
+
+    async def test_httpx_all_headers_redacted(self):
+        response = _make_mock_response(200, "<html>ok</html>")
+        response.headers = {
+            "content-type": "text/html",
+            "cache-control": "max-age=60",
+            "set-cookie": "sid=secret",
+        }
+        async_cm, _ = _make_async_client_mock(response)
+        with patch("httpx.AsyncClient", return_value=async_cm):
+            result = await self.server.fetch("http://example.com/", response_headers=True)
+        assert "Response headers:\n" in result
+        assert "  cache-control: max-age=60" in result
+        assert "  set-cookie: [REDACTED]" in result
+        assert "secret" not in result
+
+    async def test_httpx_selected_headers_only(self):
+        response = _make_mock_response(200, "<html>ok</html>")
+        response.headers = {"content-type": "text/html", "cache-control": "no-store"}
+        async_cm, _ = _make_async_client_mock(response)
+        with patch("httpx.AsyncClient", return_value=async_cm):
+            result = await self.server.fetch(
+                "http://example.com/", response_headers=["X-Robots-Tag", "cache-control"]
+            )
+        assert "  x-robots-tag: (not present)" in result
+        assert "  cache-control: no-store" in result
+        assert "  content-type:" not in result
+
+    async def test_config_enabled_per_call_disable(self):
+        self._enable(True)
+        response = _make_mock_response(200, "<html>ok</html>")
+        async_cm, _ = _make_async_client_mock(response)
+        with patch("httpx.AsyncClient", return_value=async_cm):
+            on = await self.server.fetch("http://example.com/")
+            off = await self.server.fetch("http://example.com/", response_headers=False)
+        assert "  content-type: text/html" in on
+        assert "Response headers" not in off
+
+    async def test_curl_cffi_path_shows_headers(self):
+        self.server._CONFIG["global"] = {
+            **self.server._DEFAULT_GLOBAL, "impersonate": "chrome131", "response_headers": True,
+        }
+        self.server._CONFIG["domains"] = {}
+        response = _make_curl_response(200, "body")
+        response.headers = {"content-type": "text/html", "server": "cloudflare"}
+        async_cm, _ = _make_async_curl_session_mock(response)
+        with patch("curl_cffi.requests.AsyncSession", return_value=async_cm):
+            result = await self.server.fetch("http://example.com/")
+        assert "  server: cloudflare" in result
+
+    async def test_browser_path_shows_headers(self):
+        self._enable(True)
+        with patch.object(
+            self.server, "_fetch_with_browser",
+            AsyncMock(return_value=("<html>r</html>", 200, {"Content-Type": "text/html", "X-Powered-By": "Next.js"})),
+        ):
+            result = await self.server.fetch("http://example.com/", render_js=True)
+        assert "  x-powered-by: Next.js" in result
+
+    async def test_chrome_retry_uses_retry_response_headers(self):
+        self.server._CONFIG["global"] = {
+            **self.server._DEFAULT_GLOBAL, "bot_block_detection": "retry", "response_headers": True,
+        }
+        self.server._CONFIG["domains"] = {}
+        blocked = _make_mock_response(403, "<html>Access Denied</html>")
+        blocked.headers = {"content-type": "text/html", "server": "AkamaiGHost"}
+        good = _make_mock_response(200, "<html>ok</html>")
+        good.headers = {"content-type": "text/html", "server": "nginx"}
+        good.history = []
+        async_cm, _ = _make_async_client_mock(blocked)
+        chrome_cm, _ = _make_async_client_mock(good)
+        with patch("httpx.AsyncClient", side_effect=[async_cm, chrome_cm]):
+            result = await self.server.fetch("http://example.com/")
+        assert "Status:           200" in result
+        assert "  server: nginx" in result
+
+    async def test_trace_redirects_shows_headers_per_hop(self):
+        hop = MagicMock()
+        hop.status_code = 301
+        hop.url = "http://example.com/"
+        hop.headers = {"location": "http://www.example.com/", "set-cookie": "a=1", "server": "edge"}
+        response = _make_mock_response(200, "<html>final</html>")
+        response.headers = {"content-type": "text/html", "server": "origin"}
+        response.history = [hop]
+        response.url = "http://www.example.com/"
+        async_cm, _ = _make_async_client_mock(response)
+        with patch("httpx.AsyncClient", return_value=async_cm):
+            result = await self.server.fetch(
+                "http://example.com/", trace_redirects=True, response_headers=["server", "set-cookie"]
+            )
+        assert "  301  http://example.com/  →  http://www.example.com/" in result
+        assert "      server: edge" in result
+        assert "      set-cookie: [REDACTED]" in result
+        assert "  200  http://www.example.com/  (final)" in result
+        assert "      server: origin" in result
+        # final response block as well
+        assert "Response headers:\n  server: origin\n  set-cookie: (not present)" in result
+
+    async def test_trace_redirects_without_response_headers_unchanged(self):
+        hop = MagicMock()
+        hop.status_code = 302
+        hop.url = "http://example.com/"
+        hop.headers = {"location": "http://example.com/x", "server": "edge"}
+        response = _make_mock_response(200, "<html>final</html>")
+        response.history = [hop]
+        response.url = "http://example.com/x"
+        async_cm, _ = _make_async_client_mock(response)
+        with patch("httpx.AsyncClient", return_value=async_cm):
+            result = await self.server.fetch("http://example.com/", trace_redirects=True)
+        assert "  302  http://example.com/  →  http://example.com/x" in result
+        assert "server: edge" not in result
+
+    async def test_audit_event_counts_headers_not_values(self, monkeypatch):
+        self._enable(True)
+        events = []
+        monkeypatch.setattr(self.server, "_emit_audit_event", lambda e: events.append(e))
+        response = _make_mock_response(200, "<html>ok</html>")
+        response.headers = {"content-type": "text/html", "set-cookie": "sid=secret"}
+        async_cm, _ = _make_async_client_mock(response)
+        with patch("httpx.AsyncClient", return_value=async_cm):
+            await self.server.fetch("http://example.com/")
+        assert events[-1]["response_headers_shown"] == 2
+        assert "secret" not in json.dumps(events[-1])
