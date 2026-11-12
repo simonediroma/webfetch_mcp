@@ -149,8 +149,16 @@ fetch(
     trace_redirects: bool = False,  # include full redirect chain in summary
     assert_status: int | None,   # raise ValueError if status code doesn't match
     assert_contains: str | None, # raise ValueError if string not found in body
+    render_js: bool | None,      # render with headless Chromium (playwright)
+    impersonate: str | None,     # curl-cffi TLS fingerprint target, e.g. "chrome131"
+    response_headers: bool | list[str] | None,  # show response headers in the summary
+                                 # (True = all, list = only those; sensitive values redacted)
 ) -> str
 ```
+
+`response_headers` is off by default. Pass it only when the user wants to inspect
+headers (cache, robots, CDN, redirects). With `trace_redirects=True` the same
+selection is shown for every hop.
 
 Response format:
 ```
@@ -186,11 +194,14 @@ For Claude Code's `preview_start` (dev only), port 8000 is declared in
 When `WEBFETCH_CONFIG` is set, the YAML file is loaded and the legacy env vars
 (`WEBFETCH_HEADERS`, `WEBFETCH_OUTPUT`, `WEBFETCH_SELECTORS`) are **ignored entirely**.
 
-When `WEBFETCH_CONFIG` is not set, only the three legacy env vars are read.
+When `WEBFETCH_CONFIG` is not set, only the legacy env vars are read
+(`WEBFETCH_HEADERS`, `WEBFETCH_OUTPUT`, `WEBFETCH_SELECTORS`, `WEBFETCH_RENDER_JS`,
+`WEBFETCH_RESPONSE_HEADERS`, `WEBFETCH_ALLOWED_DOMAINS`, `WEBFETCH_DENIED_DOMAINS`).
+`WEBFETCH_RESPONSE_HEADERS` is global only: `true`, `false`, or a comma-separated list of names.
 Features available exclusively via YAML (not accessible through env vars):
 `timeout`, `retry`, `proxy`, `bot_block_detection`, `sanitize_content`,
 `extract_metadata`, `tls_verify`, `tls_ca_bundle`, `tls_min_version`,
-`allowed_domains`, `denied_domains`, `impersonate`.
+`allowed_domains`, `denied_domains`, `impersonate`, per-domain `response_headers`.
 
 ---
 
@@ -206,6 +217,10 @@ Features available exclusively via YAML (not accessible through env vars):
 - `_extract_text(html)` — regex tag stripping + whitespace collapse (internal, used by legacy `extract_text=True`).
 - `_resolve_css_selector(hostname, per_call_selector)` — same domain-matching logic; returns effective CSS selector string or `None`.
 - `_apply_css_selector(html, selector)` — extracts matching elements via `BeautifulSoup.select()`; concatenates outer HTML of all matches; falls back to full HTML if nothing matches. Applied **before** `_apply_output_format`.
+- `_resolve_response_headers(hostname, per_call)` — same domain-matching logic; returns `False`, `True` or a list of lower-cased header names.
+- `_headers_to_dict(headers)` — normalises httpx / curl-cffi / Playwright response headers into `{lower_name: value}` (repeated headers joined with `", "`). Every fetch path fills `response_headers_raw` with it; `_fetch_with_browser` returns `(html, status, headers)`.
+- `_format_response_headers(headers, selection, indent)` — renders the summary lines; values of `_SENSITIVE_RESPONSE_HEADERS` become `[REDACTED]`, long values are truncated to `_RESPONSE_HEADER_VALUE_MAX`.
+- With `trace_redirects=True` the httpx path keeps the chain as `redirect_hops` (status, url, location, headers) so per-hop headers can be rendered; curl-cffi still reports the chain as unavailable.
 - Uses `httpx.AsyncClient` with `follow_redirects=True`.
 
 ---

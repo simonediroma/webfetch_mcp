@@ -39,6 +39,7 @@ This server is a drop-in replacement: it exposes the same `fetch` tool to any MC
 | **JS rendering (Playwright)** | Render JavaScript-heavy SPAs with headless Chromium before extracting content; configurable globally, per-domain, or per-call |
 | **lighthtml output format** | Strips `<style>`, `<script>` (except JSON-LD), comments, and all tag attributes — returns minimal bare HTML structure |
 | **TLS fingerprint impersonation (curl-cffi)** | Reproduce a real browser's TLS ClientHello/JA3 and HTTP/2 fingerprint, to bypass CDN bot detection that fingerprints below the header level; configurable globally, per-domain, or per-call |
+| **Response headers in summary** | Show all or selected HTTP response headers (cache, robots, CDN, content negotiation) in the summary, per hop when tracing redirects; sensitive values are always redacted. Configurable globally, per-domain, or per-call |
 
 ---
 
@@ -141,6 +142,7 @@ global:
   render_js: false           # true = render JS via headless Chromium (requires playwright)
   impersonate: null          # e.g. "chrome131" = impersonate a browser's TLS/HTTP2 fingerprint
                               # (requires curl-cffi); loses to render_js when both are set
+  response_headers: false    # false | true (all) | [list of header names] shown in the summary
 
 # Per-domain overrides — only the fields you list are overridden
 domains:
@@ -173,6 +175,9 @@ domains:
   fingerprinted-cdn.com:
     impersonate: chrome131   # bypasses TLS/JA3-fingerprint bot detection
     output_format: trafilatura
+
+  cdn-debug.example.com:
+    response_headers: [content-type, cache-control, x-robots-tag, cf-cache-status]
 ```
 
 Domain matching uses **suffix rules**: `example.com` matches both `example.com` and `www.example.com`. When multiple domains match, the most specific (longest) key wins. Global settings are always applied first, then overridden by increasingly specific domain rules.
@@ -203,6 +208,13 @@ WEBFETCH_OUTPUT={"*": "raw", "example.com": "trafilatura", "news.com": "markdown
 
 ```env
 WEBFETCH_SELECTORS={"example.com": "article.main-content", "news.com": "div#article-body"}
+```
+
+**`WEBFETCH_RESPONSE_HEADERS`** — show response headers in the summary (global only):
+
+```env
+WEBFETCH_RESPONSE_HEADERS=true                            # all headers
+WEBFETCH_RESPONSE_HEADERS=content-type,cache-control      # only these
 ```
 
 > When `WEBFETCH_CONFIG` is set, the env vars above are ignored entirely.
@@ -369,6 +381,7 @@ All parameters are optional except `url`.
 | `assert_contains` | `str \| None` | `None` | Raise an error if this string is not found in the response body (case-sensitive) |
 | `render_js` | `bool \| None` | `None` | Render the page with headless Chromium (executes JS, waits for network idle). Requires `playwright`. |
 | `impersonate` | `str \| None` | `None` | Impersonate a browser's TLS/HTTP2 fingerprint (e.g. `"chrome131"`) to bypass CDN fingerprint-based bot detection. Requires `curl-cffi`. Ignored when `render_js` is effectively true. |
+| `response_headers` | `bool \| list[str] \| None` | `None` | Show response headers in the summary: `true` = all, or a list of names (e.g. `["content-type", "cache-control"]`). Sensitive values (`Set-Cookie`, `Authorization`, …) are always redacted. With `trace_redirects=true` the same selection is shown for every hop. Overrides the domain config for this call. |
 
 ### Response format
 
@@ -394,6 +407,11 @@ Bot block:        none
 Metadata:         extracted
 Sanitization:     flag (0 pattern(s) found)
 CSS selector:     "article.main-content" (applied)
+Response headers:
+  cache-control: max-age=300
+  content-type: text/html; charset=utf-8
+  set-cookie: [REDACTED]
+  x-robots-tag: noindex
 ---
 
 **Title:** Example Article
@@ -558,6 +576,43 @@ Redirect chain:
   200  https://example.com/landing  (final)
 ```
 
+Add `response_headers` to see the selected headers at every hop (useful to find which hop sets a cookie or a cache rule):
+
+```
+fetch url="https://short.ly/abc123" trace_redirects=true response_headers=["server", "set-cookie", "cache-control"]
+```
+
+```
+Redirect chain:
+  301  https://short.ly/abc123  →  https://example.com/landing
+      server: cloudflare
+      set-cookie: [REDACTED]
+      cache-control: (not present)
+  200  https://example.com/landing  (final)
+      server: nginx
+      set-cookie: (not present)
+      cache-control: max-age=300
+```
+
+---
+
+### Inspect response headers (cache, robots, CDN)
+
+Response headers tell you whether a page is indexable (`X-Robots-Tag`), how it is cached (`Cache-Control`, `CF-Cache-Status`, `Age`), which CDN serves it, or whether the server honours content negotiation. Off by default; enable it per call, per domain, or globally:
+
+```
+fetch url="https://example.com/landing" response_headers=true
+```
+
+```yaml
+# webfetch.yaml — always show a few headers for one domain
+domains:
+  example.com:
+    response_headers: [content-type, cache-control, x-robots-tag, cf-cache-status]
+```
+
+The summary gains a `Response headers:` block. Names are lower-cased, requested-but-missing headers are marked `(not present)`, values longer than 200 characters are truncated, and the values of `Set-Cookie`, `Authorization`, `WWW-Authenticate`, `X-Api-Key` and similar headers are always replaced with `[REDACTED]` (the list is fixed and cannot be turned off). A per-call `response_headers=false` hides the block even when the domain config enables it.
+
 ---
 
 ### Leverage Cloudflare content negotiation for LLM-ready Markdown
@@ -602,6 +657,7 @@ curl -sI https://example.com -H "Accept: text/markdown" | grep -i content-type
 - **Domain isolation** — headers are injected only for matching domains; unrelated requests receive only global headers.
 - **Header injection protection** — the server validates all header names and values for control characters before sending.
 - **Prompt-injection sanitization** — optionally scan and flag/strip patterns like "ignore all previous instructions" from fetched content.
+- **Response header redaction** — when `response_headers` is enabled, `Set-Cookie`, `Authorization`, `WWW-Authenticate`, `X-Api-Key` and similar values are always shown as `[REDACTED]`; the audit log records only how many headers were shown, never their values.
 
 ---
 

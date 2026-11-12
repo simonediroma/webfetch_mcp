@@ -119,6 +119,21 @@ global:
   #
   # impersonate: null
 
+  # Show HTTP response headers in the "Request Summary" block.
+  #   false            — don't show (default)
+  #   true             — show all headers, sorted by name
+  #   [name, name, …]  — show only these (missing ones marked "(not present)")
+  #
+  # Useful to inspect caching (Cache-Control, Age, CF-Cache-Status), SEO
+  # directives (X-Robots-Tag), the CDN in front of a site, or content
+  # negotiation. With trace_redirects=true the same selection is shown for
+  # every redirect hop. Values of Set-Cookie, Authorization, WWW-Authenticate,
+  # X-Api-Key and similar headers are ALWAYS replaced with "[REDACTED]";
+  # values longer than 200 characters are truncated.
+  # Overridable per call with the tool's response_headers parameter.
+  #
+  # response_headers: false
+
 # ---------------------------------------------------------------------------
 # Per-domain overrides
 # All fields are optional — only the fields present override the global value.
@@ -163,3 +178,7 @@ domains:
   fingerprinted.example.com:
     impersonate: chrome131
     output_format: trafilatura
+
+  # A site whose caching / robots headers you want to see on every fetch
+  cdn-debug.example.com:
+    response_headers: [content-type, cache-control, x-robots-tag, cf-cache-status]
